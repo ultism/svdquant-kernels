@@ -20,6 +20,7 @@ Usage:
     modal run scripts/modal_app.py::triton_smoke        # Triton correctness (RTX-PRO-6000)
     modal run scripts/modal_app.py::triton_bench        # Triton vs nunchaku bench (RTX-PRO-6000)
     modal run scripts/modal_app.py::gemm_smoke          # gemm_w4a4 ref smoke (B200)
+    modal run scripts/modal_app.py::gemm_v0_smoke       # gemm_w4a4 v0 kernel smoke (B200, CuTe DSL)
     modal run scripts/modal_app.py::gemm_bench          # gemm_w4a4 vs fp16 torch bench (B200)
     modal run scripts/modal_app.py::lora_sat_prof_bench # LoRA kernel-pure timing via torch.profiler (B200)
 
@@ -69,9 +70,18 @@ triton_image = (
         extra_index_url="https://download.pytorch.org/whl/cu130",
     )
     .pip_install(_NUNCHAKU_WHL)
+    # CuTe DSL — the cute_kernels/ pods JIT against this. `cuda-python`
+    # is a hard dep we use directly (cuda_drv.CUstream) in the host
+    # wrapper; pin with nvidia-cutlass-dsl so the pair stays aligned.
+    .pip_install("nvidia-cutlass-dsl", "cuda-python")
     .add_local_dir(
         str(ROOT / "triton_kernels"),
         remote_path="/root/svdquant-kernels/triton_kernels",
+        copy=False,
+    )
+    .add_local_dir(
+        str(ROOT / "cute_kernels"),
+        remote_path="/root/svdquant-kernels/cute_kernels",
         copy=False,
     )
     .add_local_dir(
@@ -92,6 +102,11 @@ triton_image = (
     .add_local_file(
         str(ROOT / "tmp" / "smoke_gemm.py"),
         remote_path="/root/svdquant-kernels/tmp/smoke_gemm.py",
+        copy=False,
+    )
+    .add_local_file(
+        str(ROOT / "tmp" / "smoke_gemm_v0.py"),
+        remote_path="/root/svdquant-kernels/tmp/smoke_gemm_v0.py",
         copy=False,
     )
     .add_local_file(
@@ -160,6 +175,19 @@ def gemm_smoke() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/smoke_gemm.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=900)
+def gemm_v0_smoke() -> None:
+    """gemm_w4a4 v0 (main NVFP4 MMA only) — CuTe DSL kernel vs fp32 ref.
+
+    First real execution of the CuTe DSL pod — JIT compile is ~30s on
+    first call, per-shape compile cache keys off (out_dtype, tiler).
+    """
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/smoke_gemm_v0.py"], check=True
     )
 
 
