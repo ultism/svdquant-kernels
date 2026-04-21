@@ -25,7 +25,7 @@ fp32 ground truth — what this kernel must match per `tmp/smoke_gemm.py`).
 | v2      | + per-col `* wcscales + bias` epilogue                       |
 | v3      | + optional next-layer NVFP4 quantize                         |
 
-Currently at v0 (task #33).
+Currently at v1 (task #34).
 
 **Reference skeleton**: `tmp/cutlass/examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent.py`
 — stable-API scaled-MMA + persistent scheduler. The 1021-line

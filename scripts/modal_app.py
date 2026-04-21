@@ -110,6 +110,11 @@ triton_image = (
         copy=False,
     )
     .add_local_file(
+        str(ROOT / "tmp" / "smoke_gemm_v1.py"),
+        remote_path="/root/svdquant-kernels/tmp/smoke_gemm_v1.py",
+        copy=False,
+    )
+    .add_local_file(
         str(ROOT / "tmp" / "bench_gemm.py"),
         remote_path="/root/svdquant-kernels/tmp/bench_gemm.py",
         copy=False,
@@ -193,6 +198,19 @@ def gemm_v0_smoke() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/smoke_gemm_v0.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=900)
+def gemm_v1_smoke() -> None:
+    """gemm_w4a4 v1 (main NVFP4 + β-interleaved LoRA) — kernel vs fp32 ref.
+
+    Shares the compile cache with v0 per (dtype, tiler, R); first v1
+    call per (dtype, tiler, R) triple JITs, subsequent calls reuse.
+    """
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/smoke_gemm_v1.py"], check=True
     )
 
 
