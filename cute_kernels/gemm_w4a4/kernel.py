@@ -70,6 +70,10 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait  # noqa: E
 # cta_group = TWO + overlapping_accum).
 _TILER_SMALL_M: Tuple[int, int] = (128, 128)
 _TILER_DEFAULT: Tuple[int, int] = (128, 256)
+# 2-CTA Phase 1: tile_m=256 (two CTAs pair, each owns 128 of M), tile_n=128
+# (num_acc_stage=2 ⇒ no overlapping_accum). Phase 2 will add (256, 256)
+# with overlapping_accum. Cluster must be (2, 1) for 2-CTA.
+_TILER_2CTA: Tuple[int, int] = (256, 128)
 # Empirically M ≤ 512 wants more CTAs over bigger tiles. Break-even
 # on B200 + ZImage shape set lies between 256 (-31% at 128×256) and
 # 4352 (+3–12%); no intermediate datapoint yet, so 512 is a guess
@@ -77,7 +81,10 @@ _TILER_DEFAULT: Tuple[int, int] = (128, 256)
 _TILER_SMALL_M_THRESHOLD: int = 512
 
 
-def _pick_tiler(M: int, R: int = 0) -> Tuple[int, int]:
+def _pick_tiler(M: int, R: int = 0, use_2cta: bool = False) -> Tuple[int, int]:
+    # 2-CTA opt-in bypasses the 1-CTA shape heuristics — see `_TILER_2CTA`.
+    if use_2cta:
+        return _TILER_2CTA
     # v1 LoRA smem budget: LA (BLOCK_M × R) + LU (BLOCK_N × R), operand
     # dtype fp16/bf16. At BLOCK_N = 256, R = 256, that's 128 KB for LU
     # alone — total LoRA 192 KB eats too much of the 228 KB SM smem
@@ -88,7 +95,13 @@ def _pick_tiler(M: int, R: int = 0) -> Tuple[int, int]:
     if R >= 256:
         return _TILER_SMALL_M
     return _TILER_SMALL_M if M <= _TILER_SMALL_M_THRESHOLD else _TILER_DEFAULT
-_CLUSTER_SHAPE_MN: Tuple[int, int] = (1, 1)
+
+
+def _pick_cluster(use_2cta: bool) -> Tuple[int, int]:
+    return (2, 1) if use_2cta else (1, 1)
+
+
+_CLUSTER_SHAPE_MN: Tuple[int, int] = (1, 1)   # 1-CTA default; see _pick_cluster
 _SF_VEC_SIZE: int = 16                 # NVFP4 block size
 # Dense fp16/bf16 tcgen05 MMA atom K-reduction size on SM_100. The LoRA
 # MMA has `R_atoms = R // _LORA_INST_K` instructions to issue; this
@@ -108,6 +121,7 @@ def _check_inputs(
     out_dtype: torch.dtype,
     lora_act_in: "torch.Tensor | None" = None,
     lora_up: "torch.Tensor | None" = None,
+    use_2cta: bool = False,
 ) -> Tuple[int, int, int, int, Tuple[int, int]]:
     """Validate layout + dtype. Returns (M, N, K, R, picked_tiler).
     R = 0 when no LoRA; else R = lora_act_in.shape[1]."""
@@ -150,7 +164,10 @@ def _check_inputs(
         assert lora_up.dtype == out_dtype, \
             f"lora_up dtype {lora_up.dtype} must match out_dtype {out_dtype}"
 
-    tiler = _pick_tiler(M, R)
+    if use_2cta:
+        assert lora_act_in is None, \
+            "2-CTA Phase 1 does not support LoRA; set use_2cta=False when passing lora_*"
+    tiler = _pick_tiler(M, R, use_2cta)
     assert M % tiler[0] == 0, f"M ({M}) must be a multiple of {tiler[0]} for tiler {tiler}"
     assert N % tiler[1] == 0, f"N ({N}) must be a multiple of {tiler[1]} for tiler {tiler}"
     assert K % 32 == 0, f"K ({K}) must be a multiple of 32 for NVFP4 alignment"
@@ -236,23 +253,31 @@ def launch(
     lora_up: "torch.Tensor | None" = None,
     *,
     out_dtype: torch.dtype = torch.float16,
+    use_2cta: bool = False,
 ) -> torch.Tensor:
     """v0: y = scaled_mma(act_nvfp4, wgt_nvfp4) — no LoRA, no affine.
     v1 (when both lora_* are provided): y += lora_act_in @ lora_up.T
-    via β-interleave into the main K-loop (design §2)."""
+    via β-interleave into the main K-loop (design §2).
+
+    `use_2cta=True` opts into the 2-CTA (CtaGroup.TWO, cluster=(2,1))
+    path with tile (256, 128). Phase 1: v0-only (no LoRA), tile_n=128
+    (num_acc_stage=2, no overlapping_accum). Phase 2 will add tile
+    (256, 256) + overlapping_accum + LoRA re-enable."""
     M, N, K, R, tiler = _check_inputs(
-        act, wgt, ascales, wscales, out_dtype, lora_act_in, lora_up)
+        act, wgt, ascales, wscales, out_dtype, lora_act_in, lora_up, use_2cta)
     enable_lora = lora_act_in is not None
+    cluster_shape_mn = _pick_cluster(use_2cta)
     out = torch.empty((M, N), dtype=out_dtype, device=act.device)
 
     cache_key = (
-        _cutlass_c_dtype(out_dtype), tiler, _SF_VEC_SIZE, _CLUSTER_SHAPE_MN,
+        _cutlass_c_dtype(out_dtype), tiler, _SF_VEC_SIZE, cluster_shape_mn,
         enable_lora, R,
     )
     compiled = _COMPILED_CACHE.get(cache_key)
     if compiled is None:
         compiled = _compile(
             c_dtype=_cutlass_c_dtype(out_dtype), tiler_mn=tiler,
+            cluster_shape_mn=cluster_shape_mn,
             enable_lora=enable_lora, R=R,
         )
         _COMPILED_CACHE[cache_key] = compiled
@@ -305,6 +330,7 @@ def _compile(
     *,
     c_dtype: Type[cutlass.Numeric],
     tiler_mn: Tuple[int, int] = _TILER_DEFAULT,
+    cluster_shape_mn: Tuple[int, int] = _CLUSTER_SHAPE_MN,
     enable_lora: bool = False,
     R: int = 0,
 ):
@@ -313,7 +339,7 @@ def _compile(
     kernel_obj = Sm100GemmW4A4(
         sf_vec_size=_SF_VEC_SIZE,
         mma_tiler_mn=tiler_mn,
-        cluster_shape_mn=_CLUSTER_SHAPE_MN,
+        cluster_shape_mn=cluster_shape_mn,
         ab_dtype=cutlass.Float4E2M1FN,
         sf_dtype=cutlass.Float8E4M3FN,
         c_dtype=c_dtype,
@@ -377,13 +403,27 @@ class Sm100GemmW4A4:
     ):
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
-        assert mma_tiler_mn[0] == 128, "1SM-only; 2SM (tile_m=256) lands later"
-        assert mma_tiler_mn[1] in (128, 256), "supports tile_n ∈ {128, 256}"
-        assert cluster_shape_mn == (1, 1), "non-clustered"
-        self.use_2cta_instrs = False
+        # tile_m = 256 → 2-CTA (CtaGroup.TWO + cluster_m ≥ 2 + TMA
+        # multicast). tile_m = 128 stays 1-CTA. `cluster_shape_mn`
+        # should be (2, 1) for 2-CTA and (1, 1) for 1-CTA — caller's
+        # responsibility. 2-CTA 256×256 (overlapping_accum) is Phase 2;
+        # initial 2-CTA landing supports (256, 128) only.
+        assert mma_tiler_mn[0] in (128, 256), "tile_m ∈ {128, 256}"
+        assert mma_tiler_mn[1] in (128, 256), "tile_n ∈ {128, 256}"
+        self.use_2cta_instrs = mma_tiler_mn[0] == 256
+        if self.use_2cta_instrs:
+            assert cluster_shape_mn == (2, 1), \
+                f"2-CTA requires cluster_shape_mn=(2, 1); got {cluster_shape_mn}"
+            assert mma_tiler_mn[1] == 128, \
+                "2-CTA tile_n=256 (overlapping_accum) is Phase 2 — use (256, 128) for now"
+        else:
+            assert cluster_shape_mn == (1, 1), \
+                f"1-CTA requires cluster_shape_mn=(1, 1); got {cluster_shape_mn}"
         self.cluster_shape_mn = cluster_shape_mn
         self.mma_tiler = (*mma_tiler_mn, 1)   # K filled in setup
-        self.cta_group = tcgen05.CtaGroup.ONE
+        self.cta_group = (
+            tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
+        )
 
         self.ab_dtype = ab_dtype
         self.sf_dtype = sf_dtype
@@ -428,10 +468,12 @@ class Sm100GemmW4A4:
     # -------- host-side setup  --------
 
     def _setup_attributes(self):
-        # MMA instruction shapes
+        # MMA instruction shapes. SFB atom always runs at 1-CTA width
+        # (cta_group=ONE there), so when the main MMA is 2-CTA the SFB
+        # M dim is halved per-CTA.
         self.mma_inst_shape_mn = (self.mma_tiler[0], self.mma_tiler[1])
         self.mma_inst_shape_mn_sfb = (
-            self.mma_inst_shape_mn[0],   # 1SM, so no /2
+            self.mma_inst_shape_mn[0] // (2 if self.use_2cta_instrs else 1),
             cute.round_up(self.mma_inst_shape_mn[1], 128),
         )
 
@@ -477,7 +519,7 @@ class Sm100GemmW4A4:
             self.mma_tiler_sfb[2],
         )
 
-        # No cluster, no multicast — degenerate vmnk = (v, 1, 1, 1)
+        # Cluster layout — (1, 1) degenerate for 1-CTA, (2, 1) for 2-CTA.
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)),
             (tiled_mma.thr_id.shape,),
@@ -486,6 +528,14 @@ class Sm100GemmW4A4:
             cute.make_layout((*self.cluster_shape_mn, 1)),
             (tiled_mma_sfb.thr_id.shape,),
         )
+        # Multicast CTA counts — for 2-CTA cluster (2, 1) with thr_id
+        # shape 2, num_mcast_ctas_a/b = 1 (no along-axis broadcast; the
+        # pair-sharing is implicit via CtaGroup.TWO). For future clusters
+        # (>1 along M/N), the >1 result enables the classic A/B mcast.
+        self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
+        self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])
+        self.is_a_mcast = self.num_mcast_ctas_a > 1
+        self.is_b_mcast = self.num_mcast_ctas_b > 1
 
         # Epilogue subtile
         self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
@@ -914,8 +964,13 @@ class Sm100GemmW4A4:
         storage = smem.allocate(self.shared_storage)
 
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        # In 2-CTA clusters the pair's TMA loads converge on the same
+        # mbarrier — consumer thread count covers both CTAs when mcast
+        # is active; for the degenerate (2,1) pair no mcast, thread
+        # count stays 1.
+        num_ab_tma_producers = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, 1  # single producer CTA, no mcast
+            pipeline.Agent.Thread, num_ab_tma_producers,
         )
         ab_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
@@ -928,7 +983,12 @@ class Sm100GemmW4A4:
         )
 
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_acc_consumer_threads = self.threads_per_warp * len(self.epilog_warp_id)
+        # Epilogue consumers scale by 2 for 2-CTA (both CTAs in the pair
+        # drain the acc tmem in parallel).
+        num_acc_consumer_threads = (
+            self.threads_per_warp * len(self.epilog_warp_id)
+            * (2 if self.use_2cta_instrs else 1)
+        )
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads,
         )
@@ -964,7 +1024,7 @@ class Sm100GemmW4A4:
             storage.tmem_holding_buf,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
-            is_two_cta=False,
+            is_two_cta=self.use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar,
         )
 
@@ -991,11 +1051,30 @@ class Sm100GemmW4A4:
                 swizzle=lu_smem_layout_staged.inner,
             )
 
-        # Cluster = (1,1) → no mcast masks
+        # Multicast masks — active when 2-CTA or when cluster > 1 along
+        # M / N. Mirrors `dense_blockscaled_gemm_persistent.py`. For
+        # v0 Phase-1 2-CTA (cluster (2, 1), thr_id=2) the masks here
+        # cover the CtaGroup.TWO pair's shared-smem convergence.
         a_full_mcast_mask = None
         b_full_mcast_mask = None
         sfa_full_mcast_mask = None
         sfb_full_mcast_mask = None
+        if cutlass.const_expr(
+            self.is_a_mcast or self.is_b_mcast or self.use_2cta_instrs
+        ):
+            a_full_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2,
+            )
+            b_full_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1,
+            )
+            sfa_full_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2,
+            )
+            sfb_full_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_sfb_vmnk, block_in_cluster_coord_sfb_vmnk,
+                mcast_mode=1,
+            )
 
         # Partition global tensors
         gA_mkl = cute.local_tile(
@@ -1233,15 +1312,17 @@ class Sm100GemmW4A4:
                 tCtAcc_lora = tCtAcc_lora_base[(None, None, None, acc_stage_index)]
                 lora_consumer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer, self.num_lora_stage)
-                lora_pipeline.consumer_wait(lora_consumer_state)
+                if is_leader_cta:
+                    lora_pipeline.consumer_wait(lora_consumer_state)
                 tiled_mma_lora.set(tcgen05.Field.ACCUMULATE, True)
 
             peek_ab_full = cutlass.Boolean(1)
             ab_consumer_state.reset_count()
-            if ab_consumer_state.count < k_tile_cnt:
+            if is_leader_cta and ab_consumer_state.count < k_tile_cnt:
                 peek_ab_full = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
-            acc_pipeline.producer_acquire(acc_producer_state)
+            if is_leader_cta:
+                acc_pipeline.producer_acquire(acc_producer_state)
 
             tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
@@ -1257,60 +1338,63 @@ class Sm100GemmW4A4:
                 stride = k_atoms_total // self.R_atoms
 
             for k_tile in range(k_tile_cnt):
-                ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full)
+                if is_leader_cta:
+                    ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full)
 
-                s2t_stage_coord = (None, None, None, None, ab_consumer_state.index)
-                cute.copy(
-                    tiled_copy_s2t_sfa,
-                    tCsSFA_s2t[s2t_stage_coord], tCtSFA_s2t,
-                )
-                cute.copy(
-                    tiled_copy_s2t_sfb,
-                    tCsSFB_s2t[s2t_stage_coord], tCtSFB_s2t,
-                )
-
-                for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
-                    kblock_coord = (None, None, kblock_idx, ab_consumer_state.index)
-                    sf_kblock_coord = (None, None, kblock_idx)
-                    tiled_mma.set(tcgen05.Field.SFA,
-                                  tCtSFA[sf_kblock_coord].iterator)
-                    tiled_mma.set(tcgen05.Field.SFB,
-                                  tCtSFB[sf_kblock_coord].iterator)
-                    cute.gemm(
-                        tiled_mma, tCtAcc,
-                        tCrA[kblock_coord], tCrB[kblock_coord], tCtAcc,
+                    s2t_stage_coord = (None, None, None, None, ab_consumer_state.index)
+                    cute.copy(
+                        tiled_copy_s2t_sfa,
+                        tCsSFA_s2t[s2t_stage_coord], tCtSFA_s2t,
                     )
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    cute.copy(
+                        tiled_copy_s2t_sfb,
+                        tCsSFB_s2t[s2t_stage_coord], tCtSFB_s2t,
+                    )
 
-                    # β-interleave: sprinkle one LoRA atom every `stride`
-                    # main atoms. tcgen05 issue queue is in-order per
-                    # CTA, so the LoRA atom here sees the main atom's
-                    # acc write.
-                    if cutlass.const_expr(self.enable_lora):
-                        if r_next < self.R_atoms and k_atom_flat == next_lora_at:
-                            lora_kblock_coord = (None, None, r_next, 0)
-                            cute.gemm(
-                                tiled_mma_lora, tCtAcc_lora,
-                                tCrLA[lora_kblock_coord],
-                                tCrLU[lora_kblock_coord],
-                                tCtAcc_lora,
-                            )
-                            r_next += 1
-                            next_lora_at += stride
-                        k_atom_flat += 1
+                    for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
+                        kblock_coord = (None, None, kblock_idx, ab_consumer_state.index)
+                        sf_kblock_coord = (None, None, kblock_idx)
+                        tiled_mma.set(tcgen05.Field.SFA,
+                                      tCtSFA[sf_kblock_coord].iterator)
+                        tiled_mma.set(tcgen05.Field.SFB,
+                                      tCtSFB[sf_kblock_coord].iterator)
+                        cute.gemm(
+                            tiled_mma, tCtAcc,
+                            tCrA[kblock_coord], tCrB[kblock_coord], tCtAcc,
+                        )
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-                ab_pipeline.consumer_release(ab_consumer_state)
+                        # β-interleave: sprinkle one LoRA atom every `stride`
+                        # main atoms. tcgen05 issue queue is in-order per
+                        # CTA, so the LoRA atom here sees the main atom's
+                        # acc write.
+                        if cutlass.const_expr(self.enable_lora):
+                            if r_next < self.R_atoms and k_atom_flat == next_lora_at:
+                                lora_kblock_coord = (None, None, r_next, 0)
+                                cute.gemm(
+                                    tiled_mma_lora, tCtAcc_lora,
+                                    tCrLA[lora_kblock_coord],
+                                    tCrLU[lora_kblock_coord],
+                                    tCtAcc_lora,
+                                )
+                                r_next += 1
+                                next_lora_at += stride
+                            k_atom_flat += 1
+
+                    ab_pipeline.consumer_release(ab_consumer_state)
 
                 ab_consumer_state.advance()
                 peek_ab_full = cutlass.Boolean(1)
-                if ab_consumer_state.count < k_tile_cnt:
+                if is_leader_cta and ab_consumer_state.count < k_tile_cnt:
                     peek_ab_full = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
-            acc_pipeline.producer_commit(acc_producer_state)
+            if is_leader_cta:
+                acc_pipeline.producer_commit(acc_producer_state)
             acc_producer_state.advance()
-            acc_pipeline.producer_tail(acc_producer_state)
-            if cutlass.const_expr(self.enable_lora):
-                lora_pipeline.consumer_release(lora_consumer_state)
+            if is_leader_cta:
+                acc_pipeline.producer_tail(acc_producer_state)
+                if cutlass.const_expr(self.enable_lora):
+                    lora_pipeline.consumer_release(lora_consumer_state)
 
         # =========================================================
         # Epilogue warps (warps 0–3)

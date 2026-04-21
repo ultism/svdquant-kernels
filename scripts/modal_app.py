@@ -115,6 +115,11 @@ triton_image = (
         copy=False,
     )
     .add_local_file(
+        str(ROOT / "tmp" / "smoke_gemm_2cta.py"),
+        remote_path="/root/svdquant-kernels/tmp/smoke_gemm_2cta.py",
+        copy=False,
+    )
+    .add_local_file(
         str(ROOT / "tmp" / "bench_gemm.py"),
         remote_path="/root/svdquant-kernels/tmp/bench_gemm.py",
         copy=False,
@@ -127,6 +132,11 @@ triton_image = (
     .add_local_file(
         str(ROOT / "tmp" / "bench_gemm_v1.py"),
         remote_path="/root/svdquant-kernels/tmp/bench_gemm_v1.py",
+        copy=False,
+    )
+    .add_local_file(
+        str(ROOT / "tmp" / "bench_gemm_2cta.py"),
+        remote_path="/root/svdquant-kernels/tmp/bench_gemm_2cta.py",
         copy=False,
     )
     .add_local_file(
@@ -207,6 +217,19 @@ def gemm_v0_smoke() -> None:
 
 
 @app.function(gpu="B200", image=triton_image, timeout=900)
+def gemm_2cta_smoke() -> None:
+    """gemm_w4a4 2-CTA Phase 1 smoke — tile (256, 128), cluster (2, 1).
+
+    v0 math only (no LoRA). Checks that the CtaGroup.TWO path produces
+    bitwise-equivalent output to the 1-CTA reference on all GEMM_SHAPES.
+    """
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/smoke_gemm_2cta.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=900)
 def gemm_v1_smoke() -> None:
     """gemm_w4a4 v1 (main NVFP4 + β-interleaved LoRA) — kernel vs fp32 ref.
 
@@ -230,6 +253,15 @@ def gemm_v0_bench() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/bench_gemm_v0.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=900)
+def gemm_2cta_bench() -> None:
+    """gemm_w4a4 2-CTA Phase 1 latency sweep vs 1-CTA v0 baseline."""
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/bench_gemm_2cta.py"], check=True
     )
 
 
