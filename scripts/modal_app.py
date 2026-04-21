@@ -125,6 +125,11 @@ triton_image = (
         copy=False,
     )
     .add_local_file(
+        str(ROOT / "tmp" / "bench_gemm_v1.py"),
+        remote_path="/root/svdquant-kernels/tmp/bench_gemm_v1.py",
+        copy=False,
+    )
+    .add_local_file(
         str(ROOT / "tmp" / "bench_lora_saturation_prof.py"),
         remote_path="/root/svdquant-kernels/tmp/bench_lora_saturation_prof.py",
         copy=False,
@@ -225,6 +230,20 @@ def gemm_v0_bench() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/bench_gemm_v0.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=900)
+def gemm_v1_bench() -> None:
+    """gemm_w4a4 v1 vs v0 vs fp16-torch, same seeded inputs.
+
+    Δ_lora = t_v1 - t_v0 measures β-interleave wall-time cost. Per
+    design §2, should be ≲ 0 — LoRA atoms fill issue-pipe bubbles the
+    main MMA loop already had.
+    """
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/bench_gemm_v1.py"], check=True
     )
 
 
