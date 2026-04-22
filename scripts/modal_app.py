@@ -120,6 +120,11 @@ triton_image = (
         copy=False,
     )
     .add_local_file(
+        str(ROOT / "tmp" / "smoke_gemm_v0_fa4.py"),
+        remote_path="/root/svdquant-kernels/tmp/smoke_gemm_v0_fa4.py",
+        copy=False,
+    )
+    .add_local_file(
         str(ROOT / "tmp" / "bench_gemm.py"),
         remote_path="/root/svdquant-kernels/tmp/bench_gemm.py",
         copy=False,
@@ -251,6 +256,19 @@ def gemm_2cta_smoke() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/smoke_gemm_2cta.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=900)
+def gemm_v0_fa4_smoke() -> None:
+    """gemm_w4a4 v0 FA4 skeleton — persistent scheduler + FA4-style
+    PipelineStateSimple. Runs every shape on both 1-CTA and 2-CTA paths;
+    2-CTA is what hung under stock PipelineState (commit 61905df), so
+    passing here is the key proof-point for the rewrite.
+    """
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/smoke_gemm_v0_fa4.py"], check=True
     )
 
 

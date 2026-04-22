@@ -801,7 +801,12 @@ class Sm100GemmW4A4V0FA4:
             aw_consumer_state = make_pipeline_state_simple(
                 PipelineUserType.Consumer, self.num_ab_stage)
             # Single-stage pipeline_acc — phase bit only (XOR toggle).
-            acc_producer_phase = Int32(0)
+            # Producer starts at phase=1: `pipeline_init_arrive` pre-arms
+            # the empty barrier to parity=1, so the first `producer_acquire`
+            # with phase=1 returns immediately. Starting at 0 blocks forever
+            # (consumer never flips full, kernel hangs — was the 9-min hang
+            # on first smoke). Mirrors stock `make_pipeline_state(Producer)`.
+            acc_producer_phase = Int32(1)
 
             tCtAcc = tCtAcc_base[(None, None, None, 0)]
 
