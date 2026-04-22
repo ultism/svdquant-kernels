@@ -701,12 +701,14 @@ class Sm100GemmW4A4V0FA4:
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
         # Derived shape info for the tile index → (m_tile, n_tile, l_tile)
-        # decode. `gC_mnl` shape is ((mma_m, mma_n), num_m_cta, num_n,
-        # num_l). `num_m_cluster = num_m_cta // cluster_m`.
-        gc_shape = gC_mnl.shape
-        num_m_cta = gc_shape[1]
-        num_n = gc_shape[2]
-        num_l = gc_shape[3]
+        # decode. Use `zipped_divide` to recover `(num_m_cta, num_n, num_l)`
+        # in the canonical M-N-L order — `gC_mnl.shape` from `local_tile`
+        # reorders the coord modes to match the underlying layout's `order`
+        # (N-major c_layout places N first: gc_shape[1]=num_n, [2]=num_m),
+        # which silently mis-decodes n_tile for tile_idx ≥ num_m_cta.
+        _c_tile = cute.slice_(self.cta_tile_shape_mnk, (None, None, 0))
+        _gc_zipped = cute.zipped_divide(mC_mnl, tiler=_c_tile)
+        num_m_cta, num_n, num_l = _gc_zipped[(0, (None, None, None))].shape
         cluster_m = self.cluster_shape_mn[0]
         num_m_cluster = num_m_cta // cluster_m
         tiles_per_l = num_m_cluster * num_n
@@ -823,9 +825,22 @@ class Sm100GemmW4A4V0FA4:
                         )
                     )
 
+                # `tiled_mma.set(ACCUMULATE, …)` is a trace-time Python
+                # mutation — state is captured at each `cute.gemm` site
+                # when the MLIR is built, not when the device executes.
+                # So we need `range()` (fully unrolled at trace) rather
+                # than `cutlass.range(..., unroll=1)` (body traced once,
+                # reused at runtime): the latter would capture ACC=False
+                # at the single kblock=0 site and re-run it every k_tile,
+                # wiping the acc between K-tiles. With `range()`, MLIR
+                # holds exactly one gemm(ACC=False) at the very first
+                # unrolled position — every other site is gemm(ACC=True).
+                # The outer persistent `while tile_idx` re-runs the whole
+                # unrolled block once per tile, which is the per-tile
+                # "zero then accumulate" shape we want. Mirrors kernel.py.
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for k_tile in range(k_tile_cnt):
                     if is_leader_cta:
                         pipeline_aw.consumer_wait(aw_consumer_state)
                         s2t_stage_coord = (None, None, None, None, aw_consumer_state.index)

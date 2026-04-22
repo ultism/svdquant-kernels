@@ -125,6 +125,11 @@ triton_image = (
         copy=False,
     )
     .add_local_file(
+        str(ROOT / "tmp" / "probe_gemm_v0_fa4.py"),
+        remote_path="/root/svdquant-kernels/tmp/probe_gemm_v0_fa4.py",
+        copy=False,
+    )
+    .add_local_file(
         str(ROOT / "tmp" / "bench_gemm.py"),
         remote_path="/root/svdquant-kernels/tmp/bench_gemm.py",
         copy=False,
@@ -269,6 +274,20 @@ def gemm_v0_fa4_smoke() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/smoke_gemm_v0_fa4.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=900)
+def gemm_v0_fa4_probe() -> None:
+    """Bug 3 bisect: single shape (M=256 K=3840 fp16 1-CTA) with an
+    in-kernel `cute.printf` probe that fires once right after the
+    epi tmem_load. If printed acc values are finite and in range →
+    MMA is fine, bug is in cast/r2s/smem/TMA; if 0/nan/huge →
+    bug is pre-epi (SFA/SFB sync, pipeline phase, tmem layout).
+    """
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/probe_gemm_v0_fa4.py"], check=True
     )
 
 

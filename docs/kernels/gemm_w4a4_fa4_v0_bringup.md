@@ -125,12 +125,183 @@ because the JIT input stubs have concrete zero values and the
 `unroll=1` hint degrades it to a compile-time micro-unroll — worth
 verifying via MLIR dump before relying on the same pattern in v0 FA4.
 
-## Next action
+## Attempted fix for Bug 2 — Python `range()` unroll (insufficient)
 
-1. Add a `cute_kernels/gemm_w4a4/_accum_atoms.py` helper exposing
-   `make_init_and_accum_atoms(tiled_mma)` returning the pre-baked pair.
-2. Replace the in-loop `tiled_mma.set(ACCUMULATE, …)` calls with
-   runtime selection of `mma_atom_init` (first kblock of first K-tile
-   of each persistent tile) vs `mma_atom_accum` (everywhere else).
-3. Re-run `gemm_v0_fa4_smoke` on Modal; expect `rel ≈ 1.0` cases to
-   flip to `OK` first. If `rel = nan` cases persist, pursue as Bug 3.
+Turned out the two-atom helper from the earlier plan was overkill —
+the proper FA4-alike knob for this case is just **full trace-time
+unroll of the K-tile loop**. `kernel.py` already does exactly this
+(`for k_tile in range(k_tile_cnt):`) and it works: one `set(ACC, False)`
+before the loop + `set(ACC, True)` after the first unrolled `cute.gemm`
+→ MLIR holds exactly one `gemm(ACC=False)` at position 0 and
+`gemm(ACC=True)` everywhere else. The outer persistent `while tile_idx`
+re-runs the whole unrolled block once per tile, giving exactly the
+per-tile "zero then accumulate" pattern we want.
+
+Applied the one-line change in `kernel_v0_fa4.py`:
+
+```python
+-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
++                for k_tile in range(k_tile_cnt):
+```
+
+**Result**: `0/24` still fails. The rel pattern only nudged on 2-CTA:
+
+| K      | mode  | before  | after   |
+| ------ | ----- | ------- | ------- |
+|  3840  | 1-CTA | nan     | nan     |
+|  3840  | 2-CTA | nan     | nan     |
+| 10240  | 1-CTA | ≈ 1.0   | 1.00    |
+| 10240  | 2-CTA | ≈ 1.0   | 0.96    |
+| 15360  | 1-CTA | ≈ 1.0   | 1.00    |
+| 15360  | 2-CTA | ≈ 1.0   | 0.98    |
+
+2-CTA moved a hair, 1-CTA did not — which kills the "ACCUMULATE alone
+is the bug" theory.
+
+The smoking gun: `M=256 K=3840 N=3072 1-CTA` also fails (nan). That
+shape has **exactly one tile per CTA** — the persistent `while` iterates
+once, there is no cross-tile state reuse. So the bug fires within a
+single pass through the mainloop body, not across persistent iterations.
+ACCUMULATE trace-freeze only matters across iterations, so it can't
+be the root cause for single-tile failures.
+
+Kept the `range()` change since it's structurally correct (mirrors
+kernel.py) and does help 2-CTA marginally — but it's not Bug 2 in
+the sense of being load-bearing.
+
+## Bug 3 — single-pass correctness failure (open)
+
+Every shape fails, including `M=256` (1 tile/CTA). So every of the
+body-level paths is broken independently of the persistent scheduler.
+Two rel patterns survive:
+
+- `rel ≈ 1.0` on 1-CTA multi-tile ↔ `y_kern ≡ 0`. Epilogue runs but
+  stores zero, or tmem acc is zero at read time.
+- `rel = nan` on K=3840 shapes. `y_kern` contains Inf/NaN or `|y_ref|
+  = 0`. SF tmem pointer or scales misread → dequant blows up.
+
+Likely suspects (ordered by plausibility):
+
+1. **SFA/SFB s2t → mma sync missing**. `_mainloop_s2t_copy` lowers to
+   `tcgen05.cp` which is async. MMA reads SFA/SFB from tmem; without
+   a commit/wait between the s2t copy and the first `cute.gemm`, mma
+   reads stale / uninitialized tmem. `kernel.py` has the same
+   structural pattern without explicit sync — investigate whether
+   the sync is implicit via the consumer_wait→s2t→gemm chain at PTX
+   level, or whether `kernel.py` is relying on timing luck and
+   `v0_fa4`'s different warp split breaks it.
+2. **`pipeline_acc` phase/parity**. Fixed Bug 1 with `producer_phase=1`
+   init (unhangs), but the commit/consumer_wait/release/flip sequence
+   for single-stage may still be off by a half-cycle somewhere.
+   Epilogue `acc_consumer_phase = Int32(0)` — consumer starts at 0,
+   reads first commit (parity flips 0→1), waits for !=0 → passes.
+   But `consumer_release` arrives on empty, flipping empty 1→0 → next
+   producer_acquire waits for !=producer_phase. Follow the parity chain
+   through a full tile.
+3. **tmem layout sharing between acc and SFA/SFB**. Acc is at
+   `acc_tmem_ptr..+num_accumulator_tmem_cols` (= cta_tile_shape_mnk[1]
+   × num_acc_stage). SFA at `+num_accumulator_tmem_cols`. If
+   `num_accumulator_tmem_cols` under-counts (e.g., 2-CTA needs double,
+   or acc dtype width was miscomputed), SFA overlays part of acc, and
+   s2t SFA overwrites accumulator mid-K → garbage + possible NaN on
+   small K.
+
+## Bug 3 root cause — scheduler tile-coord decode (fixed)
+
+None of the three suspects were load-bearing. The real bug was in the
+tile-index → `(m_tile, n_tile, l_tile)` decode inside the kernel body:
+
+```python
+# WRONG — `local_tile` on N-major c_layout reorders coord modes.
+gc_shape = gC_mnl.shape
+num_m_cta = gc_shape[1]
+num_n = gc_shape[2]
+```
+
+`c_layout` is `make_ordered_layout((m, n, l), order=(1, 0, 2))`
+(N-contiguous / major). Under that order, `cute.local_tile(mC_mnl,
+(128, 128), (None, None, None))` produces `gC_mnl.shape =
+((128, 128), num_n, num_m_cta, num_l)` — **coord modes reordered to
+match the layout's `order`**. So `gc_shape[1] = num_n = 24` and
+`gc_shape[2] = num_m_cta = 2` (swapped from what the code assumed).
+
+Consequence: `num_n` was read as 2 instead of 24. The decoder
+`n_tile = (tile_idx % tiles_per_l) % num_n` then returned garbage for
+any `tile_idx >= num_m_cta` — which is the observed failure (tile 2+
+misroute their load + epi to wrong gmem regions).
+
+**Fix**: mirror the host's `_compute_grid_persistent`, which recovers
+the canonical `(num_m_cta, num_n, num_l)` via `zipped_divide`:
+
+```python
+_c_tile = cute.slice_(self.cta_tile_shape_mnk, (None, None, 0))
+_gc_zipped = cute.zipped_divide(mC_mnl, tiler=_c_tile)
+num_m_cta, num_n, num_l = _gc_zipped[(0, (None, None, None))].shape
+```
+
+`zipped_divide` returns coord shape in the canonical M-N-L order
+regardless of layout `order`.
+
+**Why `kernel.py` escaped it**: the non-persistent path uses grid
+dims directly (`mma_tile_coord_mnl = (bidx // atom, bidy, bidz)`),
+never decoding from a linear tile index — so the `num_n` miscount
+never fires.
+
+## Bisect — how we got here
+
+Strategy: add `cute.printf` probe right after `tmem_load` in the
+epilogue (`tile_idx==0 ∧ subtile_idx==0 ∧ warp_idx==epi[0] ∧
+tidx==0`) to peek at fp32 acc values, and compare against
+`y_ref[0, 0..3]` from the smoke. Expected thread-0-owned positions:
+output cols `[n_tile*128 .. n_tile*128+3]` of row 0.
+
+Data collected for `M=256 K=3840 N=3072 fp16 1-CTA`:
+
+| tile | probe acc[0..3] | expected `y_ref` | match |
+| ---- | ----------------------------- | ----------------------------- | ----- |
+| 0 (n=0) | 1.226 -1.968  4.082 -7.554 |  1.227 -1.968  4.082 -7.555 | ✓ |
+| 1 (n=1) | 12.557 4.744 -4.062 -10.077 | 12.555 4.746 -4.062 -10.078 | ✓ |
+| 2 (n=2) | -1.346 -4.109 6.987 -1.232  | -6.684 -2.867 -3.049 -0.673 | ✗ |
+
+MMA output was correct for tiles 0/1, wrong for tile 2. Confirmed bug
+is **before MMA** (load-warp TMA source addr or SFA/SFB indexing).
+Host-side diagnostics ruled out per-element corruption in epi: bad
+values cluster per-N-tile, with N-tile 0 and 1 perfectly clean and
+every N-tile ≥ 2 uniformly garbage (~500 bad cells per 128×128 tile).
+
+Final probe: print `(block_idx, tile_idx, m_tile, n_tile, l_tile)`
+from the load warp (lane 0, CTAs 0/1/2):
+
+```
+[sched] bid=0 tile_idx=0 m=0 n=0 l=0   ✓
+[sched] bid=1 tile_idx=1 m=0 n=1 l=0   ✓
+[sched] bid=2 tile_idx=2 m=1 n=0 l=0   ✗  (should be m=0 n=2)
+```
+
+→ num_n=2 inside the kernel. Root cause located.
+
+## Result
+
+1-CTA path: **12/12 shapes pass** (was 0/12). rel = 0.00e+00 on all
+shapes — bit-exact vs fp32 dequant ref.
+
+2-CTA path: M=256 passes (1 cluster); M=4352 shapes still fail. That
+is a separate bug (cross-cluster persistent scheduling) — tracked
+separately. The 1-CTA correctness is the main proof point for the
+FA4-pattern rewrite.
+
+## Lessons
+
+- `cute.local_tile(X, tiler, (None,...))` **reorders** coord modes to
+  follow the underlying layout's `order`. Not safe to index `.shape`
+  positionally assuming M-N-L. Use `zipped_divide` if you need
+  canonical ordering.
+- Pattern applies to any persistent scheduler where tile-coord decode
+  runs on the device from a flat tile index. Host-side grid computation
+  (which used `zipped_divide`) was correct; the device-side decode
+  diverged silently.
+- `cute.printf` bisect — three rounds, each narrowing by one order of
+  magnitude — took the bug from "epi is broken" (wrong) to "MMA on
+  tile 2 is broken" to "scheduler misdecodes tile 2". Worth keeping
+  the probe harness (`tmp/probe_gemm_v0_fa4.py` +
+  `modal_app.py::gemm_v0_fa4_probe`) around.
