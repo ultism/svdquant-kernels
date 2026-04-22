@@ -701,11 +701,14 @@ class Sm100GemmW4A4V0FA4:
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
         # Derived shape info for the tile index → (m_tile, n_tile, l_tile)
-        # decode. Use `zipped_divide` to recover `(num_m_cta, num_n, num_l)`
-        # in the canonical M-N-L order — `gC_mnl.shape` from `local_tile`
-        # reorders the coord modes to match the underlying layout's `order`
-        # (N-major c_layout places N first: gc_shape[1]=num_n, [2]=num_m),
-        # which silently mis-decodes n_tile for tile_idx ≥ num_m_cta.
+        # decode. Use `zipped_divide` because it gives a nested shape
+        # `((tile_m, tile_n), (num_m, num_n, num_l))` whose second mode
+        # is exactly the coord tuple we need. `local_tile` (and
+        # `flat_divide`) return a *flat* shape
+        # `(tile_m, tile_n, num_m, num_n, num_l)` — the straightforward-
+        # looking `gC_mnl.shape[1]` is then `tile_n = 128`, not
+        # `num_m_cta = 2`, off by one on every subsequent index. That
+        # silently misroutes every `tile_idx >= num_m_cta`.
         _c_tile = cute.slice_(self.cta_tile_shape_mnk, (None, None, 0))
         _gc_zipped = cute.zipped_divide(mC_mnl, tiler=_c_tile)
         num_m_cta, num_n, num_l = _gc_zipped[(0, (None, None, None))].shape

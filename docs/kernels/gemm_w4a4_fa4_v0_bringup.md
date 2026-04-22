@@ -212,26 +212,33 @@ None of the three suspects were load-bearing. The real bug was in the
 tile-index → `(m_tile, n_tile, l_tile)` decode inside the kernel body:
 
 ```python
-# WRONG — `local_tile` on N-major c_layout reorders coord modes.
+# WRONG — `local_tile`'s .shape is flat, not nested.
 gc_shape = gC_mnl.shape
 num_m_cta = gc_shape[1]
 num_n = gc_shape[2]
+num_l = gc_shape[3]
 ```
 
-`c_layout` is `make_ordered_layout((m, n, l), order=(1, 0, 2))`
-(N-contiguous / major). Under that order, `cute.local_tile(mC_mnl,
-(128, 128), (None, None, None))` produces `gC_mnl.shape =
-((128, 128), num_n, num_m_cta, num_l)` — **coord modes reordered to
-match the layout's `order`**. So `gc_shape[1] = num_n = 24` and
-`gc_shape[2] = num_m_cta = 2` (swapped from what the code assumed).
+The code assumed `gC_mnl.shape` was nested `((tile_m, tile_n),
+num_m_cta, num_n, num_l)` and indexed `[1], [2], [3]` to pick off
+`(num_m, num_n, num_l)`. Actual shape is **fully flat**:
+`(tile_m, tile_n, num_m_cta, num_n, num_l) = (128, 128, 2, 24, 1)`.
+So the code got `(num_m, num_n, num_l) = (128, 2, 24)` — off by one
+on every index. The decoder then saw `num_n=2` and silently
+misrouted every `tile_idx >= num_m_cta`.
 
-Consequence: `num_n` was read as 2 instead of 24. The decoder
-`n_tile = (tile_idx % tiles_per_l) % num_n` then returned garbage for
-any `tile_idx >= num_m_cta` — which is the observed failure (tile 2+
-misroute their load + epi to wrong gmem regions).
+This has nothing to do with `c_layout`'s `order=(1, 0, 2)`:
+`local_tile` does **not** reorder coord modes based on the input
+layout's stride order. Verified empirically by
+`tmp/trace_layout_order.py` — N-major and M-major inputs both yield
+`local_tile.shape = (128, 128, 2, 24, 1)`.
 
-**Fix**: mirror the host's `_compute_grid_persistent`, which recovers
-the canonical `(num_m_cta, num_n, num_l)` via `zipped_divide`:
+The right API to pick coord modes positionally is `zipped_divide`,
+whose shape is **nested** `((tile_m, tile_n), (num_m, num_n, num_l))`.
+Indexing with `[(0, (None, None, None))]` extracts the coord
+3-tuple directly, regardless of tiler rank or input stride order.
+
+**Fix**: mirror the host's `_compute_grid_persistent`:
 
 ```python
 _c_tile = cute.slice_(self.cta_tile_shape_mnk, (None, None, 0))
@@ -239,8 +246,14 @@ _gc_zipped = cute.zipped_divide(mC_mnl, tiler=_c_tile)
 num_m_cta, num_n, num_l = _gc_zipped[(0, (None, None, None))].shape
 ```
 
-`zipped_divide` returns coord shape in the canonical M-N-L order
-regardless of layout `order`.
+Cheat sheet for CuTe DSL divide variants:
+
+| API             | `.shape`                       | structure   |
+| --------------- | ------------------------------ | ----------- |
+| `zipped_divide` | `((tile), (num_m, num_n, ...))`| nested      |
+| `tiled_divide`  | `((tile), num_m, num_n, ...)`  | tile nested, rest flat |
+| `flat_divide`   | `(tile, num_m, num_n, ...)`    | fully flat  |
+| `local_tile`    | `(tile, num_m, num_n, ...)`    | fully flat (same as `flat_divide`) |
 
 **Why `kernel.py` escaped it**: the non-persistent path uses grid
 dims directly (`mma_tile_coord_mnl = (bidx // atom, bidy, bidz)`),
@@ -292,14 +305,15 @@ FA4-pattern rewrite.
 
 ## Lessons
 
-- `cute.local_tile(X, tiler, (None,...))` **reorders** coord modes to
-  follow the underlying layout's `order`. Not safe to index `.shape`
-  positionally assuming M-N-L. Use `zipped_divide` if you need
-  canonical ordering.
+- `cute.local_tile(X, tiler, (None,...))` returns a **flat** shape,
+  same as `flat_divide`. It does **not** reorder based on the input
+  layout's stride order (my first guess was wrong — verified in
+  `tmp/trace_layout_order.py`). Use `zipped_divide` for positional
+  coord-mode indexing.
 - Pattern applies to any persistent scheduler where tile-coord decode
   runs on the device from a flat tile index. Host-side grid computation
   (which used `zipped_divide`) was correct; the device-side decode
-  diverged silently.
+  was off by one on every index and got silently wrong values.
 - `cute.printf` bisect — three rounds, each narrowing by one order of
   magnitude — took the bug from "epi is broken" (wrong) to "MMA on
   tile 2 is broken" to "scheduler misdecodes tile 2". Worth keeping
