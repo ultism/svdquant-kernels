@@ -326,7 +326,7 @@ def cutlass_nvfp4_bench() -> None:
     )
 
 
-@app.function(gpu="B200", image=triton_image, timeout=300)
+@app.function(gpu="B200", image=triton_image, timeout=90)
 def nsys_gemm() -> None:
     """Wall-time profile of a single gemm_w4a4 invocation via CUDA events."""
     subprocess.run(["nvidia-smi"], check=True)
@@ -335,16 +335,21 @@ def nsys_gemm() -> None:
     )
 
 
-@app.function(gpu="B200", image=triton_image, timeout=300)
+@app.function(gpu="B200", image=triton_image, timeout=90)
 def probe_launch() -> None:
-    """Probe gemm_w4a4 launch — wall time + max_active_clusters via env debug."""
+    """Probe gemm_w4a4 launch — wall time + max_active_clusters via env debug.
+
+    Short container timeout by design: if the kernel is spin-hanging
+    (~40ms/iter vs ~1ms/iter healthy) the per-iter early-abort in
+    probe_launch.py kicks in first; this 90s ceiling is the backstop.
+    """
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/probe_launch.py"], check=True
     )
 
 
-@app.function(gpu="B200", image=triton_image, timeout=300)
+@app.function(gpu="B200", image=triton_image, timeout=90)
 def probe_hwinfo() -> None:
     """Probe cutlass.utils.HardwareInfo on B200 for max_active_clusters."""
     subprocess.run(["nvidia-smi"], check=True)
