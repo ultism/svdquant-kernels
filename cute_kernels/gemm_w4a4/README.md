@@ -27,14 +27,111 @@ fp32 ground truth — what this kernel must match per `tmp/smoke_gemm.py`).
 
 Currently at v1 (task #34).
 
-**Reference skeleton**: `tmp/cutlass_bs_gemm_persistent.py`
-(vendored copy of CUTLASS `examples/python/CuTeDSL/blackwell/
-dense_blockscaled_gemm_persistent.py`) — stable-API scaled-MMA +
-persistent scheduler. The 1021-line
-`experimental/blackwell/dense_block_scaled_gemm.py` is cleaner but
-its `cute.experimental` API is hard-gated to CUDA 13.1+; we're on
-CUDA 13.0 (both local and Modal's B200 image), so we base off the
-stable persistent example.
+**Reference skeleton**: Flash-Attention 4 (FA4) Blackwell forward in
+`tmp/flash-attention/flash_attn/cute/`:
+
+- `flash_fwd_sm100.py` — warp-specialized mainloop (separate `load`,
+  `mma`, epilogue methods). The mapping: our `mma` inherits the
+  two-MMA-in-one-warp pattern from FA4's `tiled_mma_qk + tiled_mma_pv`
+  signature, but points both MMA ops at the **same** tmem acc region
+  (β accumulation) instead of FA4's chained S→P→O dataflow.
+- `pipeline.py` — `PipelineStateSimple` (single `_phase_index`
+  counter, `% stages` / `// stages` properties); `_w_index_phase`
+  mixin so each warp drives its own state; `PipelineTmaUmma`
+  override adds `extra_tx_count` (multiple TMAs share one barrier)
+  and `is_leader_cta` gate (2CTA-aware).
+- `tile_scheduler.py::StaticPersistentTileScheduler` — grid clamped
+  to `sm_count`, `tile_idx += grid_dim()` advance. Dead simple.
+- `blackwell_helpers.py::gemm` / `gemm_ptx_partial` — `zero_init`
+  controls first-iter ACCUMULATE predicate; `gemm_ptx_partial`
+  takes raw `acc_tmem_addr: Int32` so two MMAs can target the
+  same tmem region (enables the β interleave without aliasing
+  through a `cute.Tensor`).
+- `AI/DEBUG_2CTA.md` — debugging guide that directly lists the
+  2CTA-specific footguns (tx_count ×`cta_group_size`, phase parity,
+  `producer_tail` deadlock, `tcgen05.commit` empty groups).
+
+Why swap from CUTLASS's `dense_blockscaled_gemm_persistent.py`: that
+example's implicit `PipelineState` is single-dimension and assumes
+1-tile-per-CTA. Our state space is 5-dimensional (pipeline stages ×
+2CTA pair barriers × persistent tile loop × LoRA β second MMA ×
+epilogue correction chain). Implicit state handles dimension 1. A
+prior persistent port passed correctness at 1-tile-per-CTA but hung
+500× when each CTA processed ~20 tiles (see commit `61905df`) —
+classic signature of phase/state drifting across tile boundaries.
+FA4's explicit per-warp `PipelineStateSimple` driven via
+`_w_index_phase` decouples pipeline state from kernel boundaries,
+so persistent iteration composes cleanly.
+
+## Architecture (FA4-derived 3-pipeline / 3-warp)
+
+### Warp roles
+
+| warp       | role                                                                                                  |
+| ---------- | ----------------------------------------------------------------------------------------------------- |
+| `load`     | TMAs for `act + ascales + wgt + wscales`; v1+ also `lora_act_in + lora_up`.                           |
+| `mma`      | main NVFP4 scaled MMA; v1+ also LoRA β FP16 MMA into the **same** tmem acc (no chained dependency).   |
+| `epilogue` | v0/v1 stub: tmem → gmem copy. v2+: `* wcscales + bias`. v3+: requantize to NVFP4 for next layer.      |
+
+### Pipelines
+
+| pipeline        | class              | stages | producer → consumer           | notes                                                                |
+| --------------- | ------------------ | ------ | ----------------------------- | -------------------------------------------------------------------- |
+| `pipeline_aw`   | `PipelineTmaUmma`  | 3–4    | `load` → `mma`, per-K-block   | `act + ascales + wgt + wscales` share one barrier via `extra_tx_count`. |
+| `pipeline_lora` | `PipelineTmaUmma`  | 1      | `load` → `mma`, per-tile      | v1+; `lora_act_in + lora_up` together (R ≤ 128, fits in one stage).  |
+| `pipeline_acc`  | `PipelineUmmaAsync`| 1      | `mma` → `epilogue`, per-tile  | single-stage: bare `producer_acquire_w_index_phase` replaces tail.   |
+
+### Pipeline state convention
+
+Each warp holds its own state, advances explicitly (FA4 `mma()` line
+1614-1618 pattern):
+
+```python
+# load warp
+aw_producer_state  = make_pipeline_state(Producer, k_stage)
+lora_producer_phase = Int32(1)         # single-stage producer starts at 1
+
+# mma warp
+aw_consumer_state  = make_pipeline_state(Consumer, k_stage)
+lora_consumer_phase = Int32(0)         # single-stage consumer starts at 0
+acc_producer_phase  = Int32(0)
+
+# epilogue warp
+acc_consumer_phase  = Int32(0)
+```
+
+State advances never reset at tile boundaries — the persistent `while
+work_tile.is_valid_tile:` loop just keeps incrementing. This is the
+whole point of the FA4 explicit-state pattern.
+
+### 2CTA conventions
+
+- `tx_count` in `PipelineTmaUmma.create(...)` **must** be computed
+  with `cta_group_size` multiplier (both CTAs' TMAs sign the same
+  cluster barrier). Baked in at pipeline creation time, not runtime.
+- `is_leader_cta` gates `arrive_and_expect_tx` — only leader CTA in
+  the cluster calls it; the barrier sees both CTAs' TMA contributions
+  against a single tx_count threshold.
+- `producer_tail` stays as-is for multi-stage `pipeline_aw`. For
+  single-stage `pipeline_lora` / `pipeline_acc`, use bare
+  `producer_acquire_w_index_phase(0, phase)` at kernel end (FA4
+  `load()` line 1505-1506 pattern) — default `producer_tail` tries
+  to acquire an already-drained slot and deadlocks under 2CTA.
+
+### What carries over from current `kernel.py`
+
+- NVFP4 SF atom repack (`repack_sf_to_cutlass_atom`).
+- `make_blockscaled_trivial_tiled_mma(...)` atom selection.
+- tmem / smem layout helpers, per-tile allocators.
+- Host-side `launch(...)` signature and torch-tensor boundary.
+
+### What gets rewritten
+
+- Device body split into `load()`, `mma()`, `epilogue()` warp-specialized
+  methods (replacing the monolithic `@cute.kernel`).
+- Pipeline creation (3 explicit `PipelineStateSimple`-driven pipelines).
+- Persistent tile iteration via `StaticPersistentTileScheduler.{get_current_work,
+  advance_to_next_work}`.
 
 ## Baseline — CUTLASS NVFP4 on same B200 / same shapes
 
