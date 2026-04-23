@@ -369,6 +369,48 @@ shapes — bit-exact vs fp32 dequant ref.
 2-CTA path: **12/12 shapes pass** (was 2/12 after Bug 3 — only the
 M=256 single-cluster shapes). rel = 0.00e+00 on all shapes.
 
+## Perf baseline vs CUTLASS (task #39 investigation)
+
+First pass at task #39 ("tile 256×256 + overlapping_accum"). Measured
+v0_fa4 2-CTA at tile_n ∈ {128, 256} in the same Modal session (same
+B200 instance, shared clock state) so tile effect isn't confounded
+with run-to-run Modal variance.
+
+```
+shape                   tile (256,128)   tile (256,256)   Δ
+M=256  K=3840  N=3072     1.1% MFU         1.0% MFU        −11%
+M=4352 K=3840  N=3072    13.8%            13.3%            −3.5%
+M=4352 K=3840  N=15360   34.0%            35.5%            +4.2%
+M=4352 K=15360 N=3840    32.2%            32.1%            −0.4%
+M=4352 K=10240 N=3072    25.8%            26.6%            +3.1%
+```
+
+Takeaways:
+
+- Tile-only gain is ≤ +4% on K-heavy / N-heavy shapes and **negative**
+  on small M (M=256) or small K·N. Not worth forcing (256,256) as
+  the 2-CTA default — keep (256,128), expose (256,256) opt-in via
+  `launch_v0(tiler_mn=(256, 256))`.
+- **Overlapping_accum ≠ tile_n=256.** CUTLASS's own `_compute_stages`
+  sets `num_acc_stage = 1 if tile_n == 256 else 2` — identical to
+  ours. CUTLASS hits 63% MFU on tile_n=256 with `num_acc_stage=1`
+  too; the 20pp gap to our 32-34% at matched tile is **not** from
+  an acc ping-pong we're missing.
+- True overlapping_accum (`num_acc_stage=2`) lives only at
+  tile_n=128 (tmem budget: 128×2 acc = 256 cols fits; 256×2 = 512
+  doesn't). Would need kernel-body surgery (dynamic stage index in
+  MMA + epilogue; phase flip every 2 advances) — filed back under
+  task #41 for now since tile_n=128 is where it applies.
+- Real MFU gap work (task #41): pipeline depth / TMA multicast
+  discipline / s2t issue rate / warp-spec thread counts — not
+  the tile lever.
+
+Code state: assertion `mma_tiler_mn[1] == 128` under 2-CTA is
+lifted so (256,256) compiles, but `_pick_tiler_v0` still returns
+(256,128) by default. Smoke is 24/24 bit-exact with default
+tile; one-off `tiler_mn=(256, 256)` runs were also 24/24 in an
+earlier iteration. Opt-in kept live for future tuning.
+
 ## Lessons
 
 - `cute.local_tile(X, tiler, (None,...))` returns a **flat** shape,

@@ -73,6 +73,12 @@ from cute_kernels.gemm_w4a4._pipeline_simple import (    # noqa: E402
 _COMPILED_CACHE: dict[tuple, object] = {}
 
 
+# 2-CTA tile_n=256 is also supported (num_acc_stage stays 1; fits tmem:
+# 256 acc + 16 sfa + 32 sfb = 304 cols of 512). Same-session A/B on
+# B200 showed ≤+4% MFU on big shapes and −3..11% on small M / small
+# K·N — net not worth making default. Opt-in via `launch_v0(tiler_mn=
+# (256, 256))`. The dominant MFU gap vs CUTLASS (~20pp at matched
+# tile) is elsewhere (pipeline discipline / TMA / s2t) — task #41.
 def _pick_tiler_v0(M: int, use_2cta: bool) -> Tuple[int, int]:
     if use_2cta:
         return _TILER_2CTA
@@ -87,14 +93,18 @@ def launch_v0(
     *,
     out_dtype: torch.dtype = torch.float16,
     use_2cta: bool = False,
+    tiler_mn: Tuple[int, int] | None = None,
 ) -> torch.Tensor:
-    """y = scaled_mma(act_nvfp4, wgt_nvfp4). No LoRA, no affine."""
+    """y = scaled_mma(act_nvfp4, wgt_nvfp4). No LoRA, no affine.
+
+    `tiler_mn` overrides the shape-adaptive pick — bench hook, do not use
+    in production paths (no validation against smem / tmem budgets)."""
     M, N, K, R, _ = _check_inputs(
         act, wgt, ascales, wscales, out_dtype,
         lora_act_in=None, lora_up=None, use_2cta=use_2cta,
     )
     assert R == 0, "v0 does not support LoRA"
-    tiler = _pick_tiler_v0(M, use_2cta)
+    tiler = tiler_mn if tiler_mn is not None else _pick_tiler_v0(M, use_2cta)
     assert M % tiler[0] == 0 and N % tiler[1] == 0
     cluster_shape_mn = (2, 1) if use_2cta else (1, 1)
     out = torch.empty((M, N), dtype=out_dtype, device=act.device)
@@ -185,8 +195,9 @@ class Sm100GemmW4A4V0FA4:
         if self.use_2cta_instrs:
             assert cluster_shape_mn == (2, 1), \
                 f"2-CTA requires cluster_shape_mn=(2, 1); got {cluster_shape_mn}"
-            assert mma_tiler_mn[1] == 128, \
-                "v0 2-CTA only supports tile_n=128 (no overlapping_accum)"
+            # Phase 2: 2-CTA supports both tile_n=128 and tile_n=256.
+            # num_acc_stage stays 1 (single-stage acc) — true overlapping_accum
+            # (num_acc_stage=2 ping-pong) requires multi-stage acc state.
         else:
             assert cluster_shape_mn == (1, 1)
         self.cluster_shape_mn = cluster_shape_mn

@@ -165,6 +165,11 @@ triton_image = (
         copy=False,
     )
     .add_local_file(
+        str(ROOT / "tmp" / "bench_gemm_v0_fa4_tile_ab.py"),
+        remote_path="/root/svdquant-kernels/tmp/bench_gemm_v0_fa4_tile_ab.py",
+        copy=False,
+    )
+    .add_local_file(
         str(ROOT / "tmp" / "probe_hwinfo.py"),
         remote_path="/root/svdquant-kernels/tmp/probe_hwinfo.py",
         copy=False,
@@ -324,6 +329,16 @@ def gemm_2cta_bench() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/bench_gemm_2cta.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=900)
+def gemm_v0_fa4_tile_ab() -> None:
+    """A/B: v0_fa4 2-CTA tile_n=128 vs 256 in same session (task #39)."""
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/bench_gemm_v0_fa4_tile_ab.py"],
+        check=True,
     )
 
 
