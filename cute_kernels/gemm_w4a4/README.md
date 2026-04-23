@@ -230,13 +230,33 @@ RTX PRO 6000 Blackwell datasheet. Run with
 | 4352, 10240, 3072, R=32    |    21.4%      |    25.2%      |
 | 4352, 10240, 3072, R=256   |    19.8%      |    23.2%      |
 
-- **bf16 consistently +3-5pp over fp16** on nunchaku — worth checking
-  if our kernel has the same asymmetry (currently we default to fp16
-  in smoke/bench, fp16 and bf16 paths are const-gated in the kernel).
+- **bf16 consistently +3-5pp over fp16** on nunchaku. Our v2_fa4+C1
+  does **not** show this lift — ran the same shapes on B200 and got
+  fp16 ≈ bf16 to within ±0.1pp on 3/4 shapes:
+
+  | shape (M, K, N, R)         | ours fp16 | ours bf16 | ours Δ | nunchaku Δ |
+  | -------------------------- | --------- | --------- | ------ | ---------- |
+  | 4352, 3840,  3072, R=128   |   11.9%   |   13.9%   |  +2.0  |  +1.5      |
+  | 4352, 3840, 15360, R=128   |   17.9%   |   18.0%   |  +0.1  |  +5.2      |
+  | 4352, 15360, 3840, R=128   |   18.2%   |   18.2%   |  +0.0  |  +5.5      |
+  | 4352, 10240, 3072, R=32    |   26.0%   |   26.0%   |  +0.0  |  +3.8      |
+
+  (fp16 numbers drifted vs the earlier table by ~2pp — Modal cross-run
+  variance.) The asymmetry makes sense: nunchaku's MMA is inline PTX
+  (`asm volatile mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`
+  vs `.f16.f16.f16.f16` in `mma_earlycuda.cuh`), two separate hand-
+  tuned PTX paths with different register packing / acc-precision
+  choices. Our CuTe DSL goes through one tcgen05 atom with ab_dtype
+  substitution — same MLIR lowering for both, no per-dtype tuning.
+  Head-to-head nunchaku fp16 ≈ us fp16 within single-digit pp;
+  nunchaku bf16 pulls away to 6-12pp ahead.
 - Peak MFU 30.5% at (M=4352 K=15360 N=3840, R=128, bf16). Production
   Flux/ZImage shapes generally land in the 17-25% range — this is
-  the "what does a mature W4A4 NVFP4 shipped kernel achieve on
-  consumer-grade Blackwell" number. Not a target we chase; it's a
-  sanity signpost for what's possible at the tcgen05 layer.
+  the "what does a mature, hand-PTX-tuned W4A4 NVFP4 kernel achieve
+  on consumer-grade Blackwell" reference. We are pre-ncu and pre-
+  bf16-specific optimization; single-digit-pp on fp16 is already a
+  good checkpoint for a CuTe DSL first-pass. Getting within bf16
+  hand-PTX territory likely requires dropping to inline PTX (out of
+  scope — defeats the CuTe DSL path choice).
 - Small-M (M=256) grid-limited (tiles / SMs < 1), 2-3% — same
   grid-starvation pattern as CUTLASS on our B200 table.
