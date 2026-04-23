@@ -185,6 +185,11 @@ triton_image = (
         copy=False,
     )
     .add_local_file(
+        str(ROOT / "tmp" / "bench_nunchaku_gemm.py"),
+        remote_path="/root/svdquant-kernels/tmp/bench_nunchaku_gemm.py",
+        copy=False,
+    )
+    .add_local_file(
         str(ROOT / "tmp" / "probe_hwinfo.py"),
         remote_path="/root/svdquant-kernels/tmp/probe_hwinfo.py",
         copy=False,
@@ -247,6 +252,21 @@ def triton_bench() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/bench_fused.py"], check=True
+    )
+
+
+@app.function(gpu="RTX-PRO-6000", image=triton_image, timeout=900)
+def nunchaku_gemm_bench() -> None:
+    """Nunchaku `gemm_w4a4` NVFP4 perf baseline on RTX PRO 6000 (SM_120a).
+
+    Direct call to `svdq_gemm_w4a4_cuda` with random inputs — timing
+    only, no correctness. Cross-arch reference point; not directly
+    comparable to our B200 v2_fa4 numbers (different peak, different
+    instruction set).
+    """
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/bench_nunchaku_gemm.py"], check=True
     )
 
 

@@ -208,3 +208,35 @@ shared-tmem acc + C1 two-stage LoRA prolog):
   (~53-59% MFU). Remaining gap is outside LoRA pipelining — stage
   tuning, TMA/mbar micro-discipline, epilogue overlap. Counter-level
   root-causing on Verda (task #48).
+
+### Cross-arch reference — nunchaku `gemm_w4a4` on RTX PRO 6000 Blackwell
+
+Nunchaku NVFP4 is gated on `__CUDA_ARCH__ >= 1200` (sm_120a/121a);
+the wheel doesn't ship an SM_100 build, so this path can't run on
+B200. We run it on RTX PRO 6000 Blackwell Server Edition (SM_120a)
+as an implementation-quality reference — not a ceiling, and **not
+apples-to-apples with our v2_fa4+C1 numbers** (different chip,
+different peak, different tensor-core ISA). GEMM_SHAPES, LoRA on,
+bias+wcscales on, `fp4=True`. MFU vs 4000 TFLOPS dense FP4 per
+RTX PRO 6000 Blackwell datasheet. Run with
+`modal run scripts/modal_app.py::nunchaku_gemm_bench`.
+
+| shape (M, K, N, R)         | nunchaku fp16 | nunchaku bf16 |
+| -------------------------- | ------------- | ------------- |
+|  256, 3840,  3072, R=128   |     2.4%      |     2.6%      |
+| 4352, 3840,  3072, R=128   |    16.2%      |    17.7%      |
+| 4352, 3840, 15360, R=128   |    19.5%      |    24.7%      |
+| 4352, 15360, 3840, R=128   |    25.0%      |    30.5%      |
+| 4352, 10240, 3072, R=32    |    21.4%      |    25.2%      |
+| 4352, 10240, 3072, R=256   |    19.8%      |    23.2%      |
+
+- **bf16 consistently +3-5pp over fp16** on nunchaku — worth checking
+  if our kernel has the same asymmetry (currently we default to fp16
+  in smoke/bench, fp16 and bf16 paths are const-gated in the kernel).
+- Peak MFU 30.5% at (M=4352 K=15360 N=3840, R=128, bf16). Production
+  Flux/ZImage shapes generally land in the 17-25% range — this is
+  the "what does a mature W4A4 NVFP4 shipped kernel achieve on
+  consumer-grade Blackwell" number. Not a target we chase; it's a
+  sanity signpost for what's possible at the tcgen05 layer.
+- Small-M (M=256) grid-limited (tiles / SMs < 1), 2-3% — same
+  grid-starvation pattern as CUTLASS on our B200 table.
