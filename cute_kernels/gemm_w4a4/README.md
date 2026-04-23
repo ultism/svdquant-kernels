@@ -164,3 +164,32 @@ Takeaways:
   overlapping_accum, task #39) should target ~60% to match CUTLASS.
 - Small-M (M=256) is grid-limited for both — 12 tiles vs 148 SMs,
   tensor cores idle most of the kernel. Don't over-read that row.
+
+### FA4 rewrite lineage — v0_fa4 (no LoRA) and v1_fa4 (+ LoRA)
+
+On the same `cutlass_nvfp4_bench` run, with v0_fa4 (persistent FA4
+skeleton) and v1_fa4 (+ β-interleaved LoRA on shared-tmem acc):
+
+| shape (M, K, N, R)         | v0_fa4 1-CTA | v0_fa4 2-CTA | v1_fa4 1-CTA | v1_fa4 2-CTA |
+| -------------------------- | ------------ | ------------ | ------------ | ------------ |
+| 4352, 3840, 3072, R=128    |    7.7%      |    7.6%      |    6.6%      |    6.0%      |
+| 4352, 3840, 15360, R=128   |   23.6%      |   24.2%      |   18.0%      |   15.2%      |
+| 4352, 15360, 3840, R=128   |   23.6%      |   26.4%      |   18.5%      |   17.0%      |
+| 4352, 10240, 3072, R=32    |   16.6%      |   17.1%      |   15.3%      |   11.6%      |
+| 4352, 10240, 3072, R=256   |   16.9%      |   16.9%      |   11.1%      |   SKIP*      |
+
+\* 2-CTA + R=256 overflows LA/LU smem (no small 2-CTA tile).
+
+- **v0_fa4 beats old v0 by +1–3 pp** (persistent scheduler win).
+- **v1_fa4 LoRA cost is larger on 2-CTA than on 1-CTA**, which is
+  anomalous — LoRA FLOPs and atom count don't depend on cluster
+  size. K-heavy / N-heavy shapes regress worst (e.g., K=3840 N=15360
+  R=128: 1-CTA 18.0% vs 2-CTA 15.2%, so 2-CTA loses 2.8pp to 1-CTA
+  once LoRA is on). v0_fa4 alone gains +0.6 pp going 1→2-CTA on the
+  same shape; adding LoRA flips the sign.
+- Hypothesis (not yet measured): LoRA atom under CtaGroup.TWO incurs
+  extra `tcgen05.commit` cluster-barrier overhead per atom, or the
+  single-stage `pipeline_lora` mbar handshake is serializing across
+  the pair. Root-causing needs ncu instruction-timeline counters —
+  Modal blocks those. Rolls into the Verda profiling track (task #41
+  equivalent for 2-CTA LoRA).
