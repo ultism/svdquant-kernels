@@ -23,11 +23,18 @@ fp32 ground truth — what this kernel must match per `tmp/smoke_gemm.py`).
 | v0      | main NVFP4 only, no LoRA, no wcscales, no bias               |
 | v1      | + LoRA β-interleaved per design §2                           |
 | v2      | + per-col `* wcscales + bias` epilogue                       |
-| v3      | + optional next-layer NVFP4 quantize                         |
+| ~~v3~~  | ~~+ optional next-layer NVFP4 quantize~~ — **dropped**       |
 
-Currently at v2 (task #35). `kernel_v0_fa4.py` is frozen as the v0/v1
-reference (flag-gated on `enable_lora`); `kernel_v2_fa4.py` is the
-post-processing fork (v1 + per-col `* wcscales + bias` in the epilogue).
+v3 dropped 2026-04-24. nunchaku only exercises `smooth_factor`+`qout`
+via `fused_gelu_mlp` (Flux v2 MLP, fc1=GELU), which requires the frame
+to pass fc2's `smooth_factor` into fc1's gemm call — same kind of
+pipeline-intrusive fusion that CLAUDE.md excludes (cf. `fuse_glu`).
+Not reachable under our drop-in-at-linear-boundary API.
+
+Currently at v2 (task #35, terminal). `kernel_v0_fa4.py` is frozen as
+the v0/v1 reference (flag-gated on `enable_lora`); `kernel_v2_fa4.py`
+is the post-processing fork (v1 + per-col `* wcscales + bias` in the
+epilogue) and the shipping surface.
 
 **Reference skeleton**: Flash-Attention 4 (FA4) Blackwell forward in
 `tmp/flash-attention/flash_attn/cute/`:

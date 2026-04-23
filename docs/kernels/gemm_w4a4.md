@@ -229,9 +229,9 @@ through NVFP4 `make_blockscaled_trivial_tiled_mma`'s SF path.
 
 ---
 
-## 8. Optional next-layer quant (v3)
+## 8. Optional next-layer quant (v3) — **dropped 2026-04-24**
 
-When `smooth_next` is non-null:
+Originally scoped to mirror nunchaku's `EpilogueQuantize`:
 
 ```
 y_scaled = y_fp32 / smooth_next_tile[BLOCK_N]    # after wcscales+bias
@@ -239,11 +239,14 @@ qout, oscales = nvfp4_quant_rows(y_scaled)
 tma_store(qout); tma_store(oscales)
 ```
 
-Mirrors `baseline/.../_nvfp4.py::quantize_nvfp4_rows`: per-row amax
-over 16-col groups → FP8 E4M3 scale → E2M1 pack.
-
-All three outputs (`qout`, `oscales`, and `y`) are valid to write; the
-rest of the frame may only consume `qout`/`oscales` and drop `y`.
+**Why dropped**: nunchaku exercises this path only via `fused_gelu_mlp`
+(`nunchaku/ops/fused.py:15`) — fc1's `gemm_w4a4` is fed `fc2.smooth_factor`
+(and `fc2.proj_down` for LoRA-down fold-in) so fc1's epilogue produces
+fc2's quantized input directly. Two adjacent linears must be aware of
+each other's parameters. That crosses the linear-op boundary and needs
+vLLM-side pipeline cooperation — the same reason CLAUDE.md excludes
+`fuse_glu`. Unreachable under our drop-in API. Re-open only if the
+vLLM integration strategy for consecutive w4a4 linears changes.
 
 ---
 
@@ -272,14 +275,14 @@ large, and dead scaffolding is worse than clean rewriting.
 
 ## 10. Staged implementation
 
-Matches task #33 – #36:
+Matches task #33 – #35 (task #36 / v3 dropped — see §8):
 
 | version | scope                                                                                                |
 | ------- | ---------------------------------------------------------------------------------------------------- |
 | v0      | main NVFP4 only, no LoRA, no wcscales, no bias. `y = scaled_mma(act, wgt)` + direct TMA store.       |
 | v1      | + LoRA β-interleaved per §2. Shared tmem acc. epilogue still bare cast.                              |
-| v2      | + per-col `* wcscales + bias` epilogue.                                                              |
-| v3      | + optional next-layer NVFP4 quantize (§8).                                                           |
+| v2      | + per-col `* wcscales + bias` epilogue. **Terminal version.**                                        |
+| ~~v3~~  | ~~+ optional next-layer NVFP4 quantize (§8).~~ **Dropped — requires vLLM pipeline fusion.**          |
 
 Each version is wired through `tmp/smoke_gemm.py` (add the kernel path
 to the three-way diff) and `tmp/bench_gemm.py` (adds a kernel column
