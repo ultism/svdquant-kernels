@@ -198,16 +198,58 @@ shared-tmem acc + C1 two-stage LoRA prolog):
   LoRA costs more than 1-CTA" anomaly is eliminated — 2-CTA is now
   ≥ 1-CTA on every LoRA shape (1-CTA column dropped as out of scope
   per `CTA1 去掉`).
-- **Mechanism (inferred, ncu pending on Verda, task #48)**: single-stage
-  pipeline_lora serialized the leader-CTA LoRA TMA → LoRA MMA against
-  the main K-loop. With 2 stages, load warp prefetches next-tile LA/LU
-  while mma warp consumes current-tile. A side fix to `lora_smem_bytes`
-  accounting (was cluster-level, should be per-CTA) also freed one
-  pipeline_aw stage, contributing.
+- **Mechanism (validated, ncu on Verda B200, task #48)**: ran 6 single-
+  kernel ncu captures on B200 (`--set detailed`, hmma subpipe metric is
+  the NVFP4 tensor-pipe counter on Blackwell — UTCQMMA routes there).
+  Three v2_fa4 configurations on shape A (M=4352 K=3840 N=3072 R=128
+  fp16) — `num_lora_stage=0/1/2` via the `_patch_lora_stage` harness
+  override (`tmp/profile_gemm_v2_fa4.py`) — plus CUTLASS NVFP4 persistent
+  GEMM at the same shape and at K-heavy shape B (M=4352 K=15360 N=3840):
+
+  | metric                        | v2 stage0 (LoRA off) | v2 stage1 (pre-C1) | v2 stage2 (C1) | CUTLASS A |
+  | ----------------------------- | --------------- | --------------- | --------------- | ---------- |
+  | duration (µs)                 |     42.0        |     77.1        |     69.6        |     40.9   |
+  | SM throughput %               |     52.3        |     54.6        |     41.2        |     57.9   |
+  | Memory throughput %           |     42.0        |     27.5        |     27.6        |     54.4   |
+  | DRAM throughput %             |      5.7        |      3.5        |      3.9        |      5.9   |
+  | hmma subpipe % (NVFP4 tcore)  |   **60.5**      |     31.8        |   **34.9**      |   **60.3** |
+  | warp cycles / issued inst     |     15.0        |     18.6        |     25.9        |     13.9   |
+  | long_scoreboard cyc (L1TEX)   |     10.6        |     13.8        |     21.8        |      9.5   |
+
+  Three findings:
+
+  1. **v2_fa4 main MMA matches CUTLASS in isolation.** stage0 vs
+     CUTLASS A: 42.0 vs 40.9 µs (Δ 2.7%), hmma 60.5 vs 60.3%. The FA4
+     skeleton's main K-loop is competitive with the hand-tuned CUTLASS
+     persistent kernel — the gap is not in the main MMA.
+  2. **LoRA prolog halves NVFP4 tensor-pipe utilization.** stage0 → stage2
+     drops hmma from 60.5% to 34.9% (−25.6pp). DRAM throughput is low
+     (≤6%) across all configs, so it is **not** DRAM bandwidth — the
+     dominant stall is `long_scoreboard` on L1TEX (warp waiting for an
+     SMEM load). LA/LU loads are serialized against the main K-loop's
+     A/B SMEM consumption inside the same SM.
+  3. **C1 (`num_lora_stage=2`) is a partial fix.** stage1 → stage2 cuts
+     duration 9.7% (77.1 → 69.6 µs) and lifts hmma +3.1pp. The 2-stage
+     prolog amortizes prolog cost across more main MMA iterations, but
+     L1TEX wait per warp-cycle actually rises (13.8 → 21.8 cyc) because
+     the kernel issues fewer instructions overall — net win on duration,
+     no improvement on the latency root cause. The rest of the
+     pre-C1 v1_fa4 → v2_fa4+C1 ~2.4× speedup (table above) came from
+     the v1→v2 `lora_smem_bytes` accounting fix (was cluster-level,
+     freed one pipeline_aw stage), not from C1's stage count.
 - **v2_fa4+C1 2-CTA still 35-50pp below CUTLASS 2-CTA 256×128 ceiling**
-  (~53-59% MFU). Remaining gap is outside LoRA pipelining — stage
-  tuning, TMA/mbar micro-discipline, epilogue overlap. Counter-level
-  root-causing on Verda (task #48).
+  (~53-59% MFU). On K-heavy shape B (M=4352 K=15360 N=3840) the gap is
+  **1.98×** (v2_fa4 287 µs / hmma 35.6% vs CUTLASS 145 µs / hmma 70.3%).
+  Remaining gap is outside the C1 patch's scope — directions worth
+  exploring next:
+
+  - Increase LoRA prolog stage count beyond 2 (stage=3?) to deepen
+    the latency-hiding window without doubling smem again.
+  - Move LoRA TMA loads to the `multicast` cluster path so LA/LU
+    bytes are shared across both CTAs (currently only A/B are
+    multicast in 2-CTA mode).
+  - Overlap LoRA MMA with the main K-loop's epilogue tail rather
+    than running it strictly before the main MMA exit.
 
 ### Cross-arch reference — nunchaku `gemm_w4a4` on RTX PRO 6000 Blackwell
 
