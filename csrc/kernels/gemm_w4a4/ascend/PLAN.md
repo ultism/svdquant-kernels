@@ -40,14 +40,14 @@
 - [x] `csrc/kernels/CMakeLists.txt` 的 `svdquant_add_kernel_pod` 检测 `kernel_device.cpp`，用 `ascendc_library(... STATIC ...)` + `ascendc_include_directories(... PTO_INCLUDE_DIR ...)` 编，最后 `target_link_libraries(host_obj PUBLIC <pod>_device)`。
 - [x] `./scripts/build.sh CUDA=OFF ASCEND=ON` 产出 `lib/libsvdquant_gemm_w4a4_device.a` (~1.1MB，含 ascendc 运行时 + AIC/AIV merged device blob + host_stub)。
 
-#### Phase 1b — host launcher 起空 kernel ✅（编译/链接层）
+#### Phase 1b — host launcher 起空 kernel ✅（编译/链接层 + NPU 真机）
 
 - [x] `ascend/kernel.cpp` 改造：`aclrtMalloc` device blob + `aclrtMemcpy` H2D + `aclrtlaunch_svdquant_gemm_w4a4_kernel(blockDim=1, stream, dev_params)` + `aclrtFree`。
 - [x] auto-gen header `aclrtlaunch_svdquant_gemm_w4a4_kernel.h` 通过 device 静态库的 INTERFACE include propagation 自动可见。
 - [x] `tmp/smoke_gemm_w4a4_link.cpp` 验证 host obj + device 静态库 + ascendcl/runtime/tiling_api/... 一组依赖能链通（产出 ELF）。
-- [ ] **OpenI NPU smoke**（pending external）：本地 WSL2 没 NPU 驱动，`__register_kernels` constructor 一启动就 `RegisterAscendBinary` 失败。要在 OpenI Atlas A2/A3 pod 上跑——`ship.sh` 上传 build artifacts，trivial 调用 `svdquant::ascend::gemm_w4a4(...)` + `aclrtSynchronizeStream`，确认 kernel launch + return（不要求结果正确）。
+- [x] **GitCode Space 910B smoke 通过** (2026-05-07)：OpenI 不可用后改走 GitCode (AtomGit) AI 社区的免费 910B Space。`gitcode-space` 分支携带本地 cross-built 的 3 个 aarch64 .o（host_stub + kernel + smoke_main），Space 容器侧 `link_smoke.sh` 完成最终链接，`app.py`（Gradio 6.9.0）启动时执行：smoke 跑 `aclInit → aclrtSetDevice(0) → aclrtCreateStream → svdquant::ascend::gemm_w4a4(...) → aclrtSynchronizeStream → aclFinalize`，返回码 0。链接需要的全套 -l 参数 + `-Wl,--copy-dt-needed-entries` 已固化在 `space/link_smoke.sh`。
 
-**当前状态**：编译/链接全绿。NPU 运行验证待 OpenI smoke。
+**当前状态**：编译/链接 + NPU 真机 launch 全绿。可以进 Phase 2。
 
 ### Phase 2 — Cube/Vec 协作骨架（通信不死锁）
 
