@@ -29,13 +29,20 @@ for f in "${RUNTIME_A}" "${ASCENDCL_SO}"; do
 done
 
 set -x
+# --copy-dt-needed-entries: let ld follow DT_NEEDED in shared libs we
+# pull through libascendc_runtime.a, instead of erroring out with
+# "DSO missing from command line" on every transitive symbol
+# (MsprofStr2Id, mmGetTid, ...). Saves a -l-whack-a-mole loop.
 g++ -O2 \
     "${HERE}/objects/host_stub.cpp.o" \
     "${HERE}/objects/kernel.cpp.o" \
     "${HERE}/objects/smoke_main.cpp.o" \
+    -Wl,--copy-dt-needed-entries \
     -Wl,--whole-archive "${RUNTIME_A}" -Wl,--no-whole-archive \
     -L"${LIBDIR}" \
-    -lascendcl -lruntime -lerror_manager -lprofapi \
+    -lascendcl -lruntime -lerror_manager -lprofapi -lmmpa \
+    -lascend_dump -lascendalog -lge_common_base -lc_sec \
+    -lregister -lplatform -ltiling_api \
     -ldl -lpthread \
     -Wl,-rpath,"${LIBDIR}" \
     -o "${HERE}/svdquant_gemm_w4a4_smoke"
