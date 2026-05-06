@@ -72,7 +72,7 @@ with gr.Blocks(title="svdquant-kernels — Ascend 910B Phase 1b smoke") as demo:
         "launch path itself."
     )
     btn = gr.Button("Run smoke")
-    out = gr.Textbox(label="Output", lines=24, max_lines=60, show_copy_button=True)
+    out = gr.Textbox(label="Output", lines=24, max_lines=60)
     btn.click(fn=link_then_run, inputs=None, outputs=out)
 
 
