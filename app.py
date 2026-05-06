@@ -1,14 +1,18 @@
 """Gradio frontend for the svdquant-kernels Phase 1b NPU launch smoke.
 
-What this Space does:
+Container-as-health-check semantics. On Space startup, before launching
+the gradio webui, we link the pre-cross-built aarch64 .o files in
+``space/objects/`` and run the resulting smoke binary. The full output
+is dumped to stdout so the Space's container log keeps the trace
+regardless of webui state.
 
-1. On the FIRST button press, runs ``space/link_smoke.sh`` to link the
-   pre-cross-built aarch64 .o files in ``space/objects/`` against the
-   container's native aarch64 CANN runtime, producing
-   ``space/svdquant_gemm_w4a4_smoke``.
-2. Runs the resulting binary, which calls ``aclInit`` -> launches a
-   placeholder ``gemm_w4a4`` kernel -> ``aclrtSynchronizeStream`` ->
-   exits. Stdout/stderr are echoed back to the page.
+If the smoke fails, the process exits non-zero — the Space sees a
+crashed container and surfaces it; no webui ever starts. This matches
+the user's "serverless-style" expectation where you read errors from
+the log panel, not by clicking around in a UI that may not even render.
+
+If the smoke succeeds, the gradio webui starts with the captured output
+already shown in a Textbox, plus a Re-run button for retries.
 
 The kernel itself is a no-op placeholder. This Space exists to verify
 that the cross-build artifacts actually launch on a real 910B before
@@ -20,6 +24,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import gradio as gr
@@ -48,30 +53,51 @@ def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str]:
     return proc.returncode, out
 
 
-def link_then_run() -> str:
+def link_then_run() -> tuple[bool, str]:
     log: list[str] = []
     log.append(f"ASCEND_HOME_PATH={os.environ.get('ASCEND_HOME_PATH', '<unset>')}")
     log.append(f"smoke binary present: {SMOKE_BIN.exists()}")
     if not SMOKE_BIN.exists():
-        os.chmod(LINK_SCRIPT, 0o755)
+        try:
+            os.chmod(LINK_SCRIPT, 0o755)
+        except OSError:
+            pass
         rc, out = _run(["bash", str(LINK_SCRIPT)])
         log.append(out)
         if rc != 0:
-            return "\n".join(log) + "\n[FAIL] link step returned non-zero"
+            log.append("[FAIL] link step returned non-zero")
+            return False, "\n".join(log)
     rc, out = _run([str(SMOKE_BIN)])
     log.append(out)
-    verdict = "[OK] kernel launched and stream synced" if rc == 0 else f"[FAIL] smoke exited {rc}"
-    return "\n".join(log) + "\n" + verdict
+    if rc == 0:
+        log.append("[OK] kernel launched and stream synced")
+        return True, "\n".join(log)
+    log.append(f"[FAIL] smoke exited {rc}")
+    return False, "\n".join(log)
 
 
-# Run the smoke once at module-import / Space-startup time, so the page
-# shows the result on first load without a manual button press.
-INITIAL_OUTPUT = link_then_run()
+def _print_banner(title: str) -> None:
+    bar = "=" * 72
+    print(bar, flush=True)
+    print(title, flush=True)
+    print(bar, flush=True)
+
+
+# === Container-as-health-check: run smoke before launching the webui ===
+_print_banner("svdquant-kernels Phase 1b smoke — running before webui")
+ok, INITIAL_OUTPUT = link_then_run()
+print(INITIAL_OUTPUT, flush=True)
+_print_banner("smoke OK" if ok else "smoke FAILED — exiting before webui starts")
+
+if not ok:
+    # Crash the container so the Space log panel keeps the full trace
+    # and the platform shows the run as failed. No webui to obscure it.
+    sys.exit(1)
 
 
 def rerun() -> str:
-    # Re-link (no-op if binary already exists) + re-run the smoke.
-    return link_then_run()
+    _, txt = link_then_run()
+    return txt
 
 
 with gr.Blocks(title="svdquant-kernels — Ascend 910B Phase 1b smoke") as demo:
@@ -80,7 +106,9 @@ with gr.Blocks(title="svdquant-kernels — Ascend 910B Phase 1b smoke") as demo:
         "Cross-built locally on x86_64 (CANN 8.5), final link runs on this 910B "
         "container. The kernel is a no-op placeholder — this only verifies the "
         "launch path itself.\n\n"
-        "The smoke runs automatically on Space startup; output below."
+        "Smoke ran on container startup; output captured below. If it had "
+        "failed, this webui would never have started — the Space's log panel "
+        "would have the trace instead."
     )
     out = gr.Textbox(label="Output", lines=24, max_lines=60, value=INITIAL_OUTPUT)
     btn = gr.Button("Re-run")
