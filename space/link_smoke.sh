@@ -35,7 +35,7 @@ g++ -O2 \
     "${HERE}/objects/smoke_main.cpp.o" \
     -Wl,--whole-archive "${RUNTIME_A}" -Wl,--no-whole-archive \
     -L"${LIBDIR}" \
-    -lascendcl -lruntime -lerror_manager \
+    -lascendcl -lruntime -lerror_manager -lprofapi \
     -ldl -lpthread \
     -Wl,-rpath,"${LIBDIR}" \
     -o "${HERE}/svdquant_gemm_w4a4_smoke"

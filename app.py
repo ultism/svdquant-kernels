@@ -64,16 +64,27 @@ def link_then_run() -> str:
     return "\n".join(log) + "\n" + verdict
 
 
+# Run the smoke once at module-import / Space-startup time, so the page
+# shows the result on first load without a manual button press.
+INITIAL_OUTPUT = link_then_run()
+
+
+def rerun() -> str:
+    # Re-link (no-op if binary already exists) + re-run the smoke.
+    return link_then_run()
+
+
 with gr.Blocks(title="svdquant-kernels — Ascend 910B Phase 1b smoke") as demo:
     gr.Markdown(
         "# svdquant-kernels — Ascend 910B Phase 1b smoke\n"
         "Cross-built locally on x86_64 (CANN 8.5), final link runs on this 910B "
         "container. The kernel is a no-op placeholder — this only verifies the "
-        "launch path itself."
+        "launch path itself.\n\n"
+        "The smoke runs automatically on Space startup; output below."
     )
-    btn = gr.Button("Run smoke")
-    out = gr.Textbox(label="Output", lines=24, max_lines=60)
-    btn.click(fn=link_then_run, inputs=None, outputs=out)
+    out = gr.Textbox(label="Output", lines=24, max_lines=60, value=INITIAL_OUTPUT)
+    btn = gr.Button("Re-run")
+    btn.click(fn=rerun, inputs=None, outputs=out)
 
 
 if __name__ == "__main__":
