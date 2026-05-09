@@ -12,15 +12,26 @@
 //        right after the cube ring inside `out`. Each subblock owns
 //        its own M/2 row stripe; both stripes get validated.
 //        Mock math: vec_out[m,n] = K * scale + K = 128 * 0.5 + 128 = 192.
+//   2d — Cube fires kNumTiles tiles into a kRingSlots ring with a
+//        preload + main-loop double-stage driver and back-pressure
+//        from vec via VEC_TILE_CONSUMED. Vec consumes each tile and
+//        TSTOREs to a linear [kNumTiles, M, N] vec_out region after
+//        the ring. Each tile reuses the same act/wgt (mock), so
+//        every vec_out tile carries the same 192.0 sentinel; smoke
+//        validates ALL kNumTiles segments, which exercises slot
+//        reuse (tiles 6-7 land back in slots 0-1 reused after vec
+//        consumed them).
 //
 // Stdout is what the Gradio app pipes back to the page; the smoke
 // emits one of:
 //   smoke OK     — every checked element matches reference within
-//                  fp32 epsilon (cube ring slot 0 + vec_out segment).
+//                  fp32 epsilon. Phase 2d validates the entire
+//                  vec_out region (kNumTiles × M × N elements); the
+//                  cube ring's final state is a function of slot
+//                  reuse so we don't pin those values directly.
 //   smoke FAILED <stage> — earlier ACL error or numeric mismatch.
 //                  Stages: Init, NoDevice, SetDevice, Stream, Malloc,
-//                  Memcpy, Memset, Sync, MemcpyD2H, MismatchSlot0,
-//                  MismatchVecOut.
+//                  Memcpy, Memset, Sync, MemcpyD2H, MismatchVecOut.
 
 #include <acl/acl.h>
 #include <cmath>
@@ -36,9 +47,10 @@ namespace {
 constexpr int   kTileM     = 64;
 constexpr int   kTileK     = 128;
 constexpr int   kTileN     = 128;
-constexpr int   kRingSlots = 6;     // cube ring (Phase 2b)
-constexpr int   kVecOutSlots = 1;   // tail segment after the ring (Phase 2c)
-constexpr float kVecScale  = 0.5f;  // matches kernel.cpp's launcher-side const
+constexpr int   kRingSlots = 6;     // cube ring (Phase 2b/2d)
+constexpr int   kNumTiles  = 8;     // tiles produced per launch (Phase 2d)
+                                    // — must match kernel_device.cpp.
+constexpr float kVecScale  = 0.5f;  // matches device-side kVecScale
 
 const char* AclErr() {
     const char* s = aclGetRecentErrMsg();
@@ -89,10 +101,13 @@ int main() {
     // ---- allocate device buffers + seed act/wgt = ones ----
     const size_t actBytes = sizeof(uint16_t) * kTileM * kTileK;
     const size_t wgtBytes = sizeof(uint16_t) * kTileN * kTileK;
-    // out covers cube ring + vec_out tail; smoke knows both are inside
-    // the same allocation, kernel.cpp's DeviceParams.out points to its
-    // base, and the device kernel splits via fixed offsets.
-    const int    kTotalSlots = kRingSlots + kVecOutSlots;
+    // out covers cube ring + linear vec_out tail (kNumTiles slots);
+    // kernel.cpp's DeviceParams.out points to its base, and the device
+    // kernel splits via fixed offsets:
+    //   [0 .. kRingSlots)                cube ring
+    //   [kRingSlots .. kRingSlots+kNumTiles)
+    //                                    vec_out, one slot per tile
+    const int    kTotalSlots = kRingSlots + kNumTiles;
     const size_t outBytes    = sizeof(float) * kTotalSlots * kTileM * kTileN;
     const size_t slotElems   = static_cast<size_t>(kTileM) * kTileN;
     const size_t vecOutBaseElems = static_cast<size_t>(kRingSlots) * slotElems;
@@ -142,8 +157,8 @@ int main() {
     p.wgt.data = dWgt;
     p.out.data = dOut;
 
-    std::printf("[smoke] launching gemm_w4a4 (Phase 2c cube+vec mock, M=%d K=%d N=%d, vec_scale=%.2f)\n",
-                kTileM, kTileK, kTileN, kVecScale);
+    std::printf("[smoke] launching gemm_w4a4 (Phase 2d preload+main, M=%d K=%d N=%d, ring=%d, num_tiles=%d, vec_scale=%.2f)\n",
+                kTileM, kTileK, kTileN, kRingSlots, kNumTiles, kVecScale);
     svdquant::ascend::gemm_w4a4(p, stream);
 
     std::printf("[smoke] aclrtSynchronizeStream\n");
@@ -162,57 +177,48 @@ int main() {
         return cleanup(9, "MemcpyD2H");
     }
 
-    // (1) Cube ring slot 0: act = wgt = ones(half) → out[m,n] = K = 128.
+    // Validate every vec_out tile: each = K * scale + K = 128 * 0.5 + 128 = 192.
+    // The cube ring's final state isn't directly validated because slots
+    // get re-written as the kNumTiles loop wraps around the kRingSlots
+    // ring; the vec_out tiles are the canonical evidence that every
+    // produced cube tile was correctly consumed. Mismatches per tile
+    // pinpoint which iteration of the preload/main-loop wave broke.
     const float expectedRing = static_cast<float>(kTileK);
-    int ringMismatches = 0;
-    int firstRingBadIdx = -1;
-    float firstRingBadVal = 0.0f;
-    for (int m = 0; m < kTileM; ++m) {
-        for (int n = 0; n < kTileN; ++n) {
-            const int idx = m * kTileN + n;  // slot 0 starts at offset 0
-            const float v = hOut[idx];
-            if (std::fabs(v - expectedRing) > 1e-3f) {
-                if (ringMismatches == 0) {
-                    firstRingBadIdx = idx;
-                    firstRingBadVal = v;
+    const float expectedVec  = expectedRing * kVecScale + expectedRing;
+    int totalMismatches  = 0;
+    int firstBadTile     = -1;
+    int firstBadIdxInTile = -1;
+    float firstBadVal    = 0.0f;
+
+    for (int t = 0; t < kNumTiles; ++t) {
+        const size_t tile_base = vecOutBaseElems + static_cast<size_t>(t) * slotElems;
+        int tileMismatches = 0;
+        for (int m = 0; m < kTileM; ++m) {
+            for (int n = 0; n < kTileN; ++n) {
+                const size_t idx = tile_base + static_cast<size_t>(m) * kTileN + n;
+                const float v = hOut[idx];
+                if (std::fabs(v - expectedVec) > 1e-3f) {
+                    if (totalMismatches == 0) {
+                        firstBadTile      = t;
+                        firstBadIdxInTile = m * kTileN + n;
+                        firstBadVal       = v;
+                    }
+                    ++tileMismatches;
+                    ++totalMismatches;
                 }
-                ++ringMismatches;
             }
         }
-    }
-    if (ringMismatches == 0) {
-        std::printf("[smoke] cube ring slot 0 validated: %d x %d elements all = %.1f (= Tile_K)\n",
-                    kTileM, kTileN, expectedRing);
-    } else {
-        std::printf("[smoke] cube ring slot 0 mismatch: %d / %d off; first at idx %d = %.4f (expected %.1f)\n",
-                    ringMismatches, kTileM * kTileN, firstRingBadIdx, firstRingBadVal, expectedRing);
-        return cleanup(10, "MismatchSlot0");
+        std::printf("[smoke] vec_out tile %d/%d: %d mismatches\n",
+                    t, kNumTiles, tileMismatches);
     }
 
-    // (2) vec_out: vec_out[m,n] = K * scale + K = 128 * 0.5 + 128 = 192.
-    const float expectedVec = expectedRing * kVecScale + expectedRing;
-    int vecMismatches = 0;
-    int firstVecBadIdx = -1;
-    float firstVecBadVal = 0.0f;
-    for (int m = 0; m < kTileM; ++m) {
-        for (int n = 0; n < kTileN; ++n) {
-            const size_t idx = vecOutBaseElems + static_cast<size_t>(m) * kTileN + n;
-            const float v = hOut[idx];
-            if (std::fabs(v - expectedVec) > 1e-3f) {
-                if (vecMismatches == 0) {
-                    firstVecBadIdx = static_cast<int>(idx - vecOutBaseElems);
-                    firstVecBadVal = v;
-                }
-                ++vecMismatches;
-            }
-        }
-    }
-    if (vecMismatches == 0) {
-        std::printf("[smoke] vec_out validated: %d x %d elements all = %.1f (= K*scale+K = %d*%.1f+%d)\n",
-                    kTileM, kTileN, expectedVec, kTileK, kVecScale, kTileK);
+    if (totalMismatches == 0) {
+        std::printf("[smoke] vec_out validated: %d tiles x %d x %d = %d elements all = %.1f (= K*scale+K = %d*%.1f+%d)\n",
+                    kNumTiles, kTileM, kTileN, kNumTiles * kTileM * kTileN,
+                    expectedVec, kTileK, kVecScale, kTileK);
     } else {
-        std::printf("[smoke] vec_out mismatch: %d / %d off; first at idx %d (in vec_out) = %.4f (expected %.1f)\n",
-                    vecMismatches, kTileM * kTileN, firstVecBadIdx, firstVecBadVal, expectedVec);
+        std::printf("[smoke] vec_out mismatch: %d total; first at tile %d, in-tile idx %d = %.4f (expected %.1f)\n",
+                    totalMismatches, firstBadTile, firstBadIdxInTile, firstBadVal, expectedVec);
         return cleanup(11, "MismatchVecOut");
     }
 
