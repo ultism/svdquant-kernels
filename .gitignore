@@ -26,3 +26,10 @@ tmp/*
 !tmp/.gitkeep
 log/*
 !log/.gitkeep
+
+# gitcode-space branch only: ship cross-built aarch64 artifacts so the
+# Space container does only the final link step (slow ARM compile of
+# the ascendc pipeline avoided). On main these patterns stay caught by
+# the *.o / *.so rules above.
+!space/objects/*.o
+!space/objects/*.bin
