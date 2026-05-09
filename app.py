@@ -1,4 +1,4 @@
-"""Gradio frontend for the svdquant-kernels Phase 1b NPU launch smoke.
+"""Gradio frontend for the svdquant-kernels NPU smoke.
 
 Container-as-health-check semantics. On Space startup, before launching
 the gradio webui, we link the pre-cross-built aarch64 .o files in
@@ -14,9 +14,9 @@ the log panel, not by clicking around in a UI that may not even render.
 If the smoke succeeds, the gradio webui starts with the captured output
 already shown in a Textbox, plus a Re-run button for retries.
 
-The kernel itself is a no-op placeholder. This Space exists to verify
-that the cross-build artifacts actually launch on a real 910B before
-moving to Phase 2 (cube/vec coordination + real algorithm).
+The smoke binary self-identifies which phase it's testing (1b launch
+path, 2a cube/vec dispatch, 2b cube fp16 mock GEMM, …); this app.py
+is phase-agnostic and just propagates exit codes + stdout.
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ def _print_banner(title: str) -> None:
 
 
 # === Container-as-health-check: run smoke before launching the webui ===
-_print_banner("svdquant-kernels Phase 1b smoke — running before webui")
+_print_banner("svdquant-kernels NPU smoke — running before webui")
 ok, INITIAL_OUTPUT = link_then_run()
 print(INITIAL_OUTPUT, flush=True)
 _print_banner("smoke OK" if ok else "smoke FAILED — exiting before webui starts")
@@ -100,12 +100,12 @@ def rerun() -> str:
     return txt
 
 
-with gr.Blocks(title="svdquant-kernels — Ascend 910B Phase 1b smoke") as demo:
+with gr.Blocks(title="svdquant-kernels — Ascend 910B NPU smoke") as demo:
     gr.Markdown(
-        "# svdquant-kernels — Ascend 910B Phase 1b smoke\n"
+        "# svdquant-kernels — Ascend 910B NPU smoke\n"
         "Cross-built locally on x86_64 (CANN 8.5), final link runs on this 910B "
-        "container. The kernel is a no-op placeholder — this only verifies the "
-        "launch path itself.\n\n"
+        "container. The smoke binary itself reports which phase is being "
+        "tested in its stdout; this UI is just a viewer.\n\n"
         "Smoke ran on container startup; output captured below. If it had "
         "failed, this webui would never have started — the Space's log panel "
         "would have the trace instead."
