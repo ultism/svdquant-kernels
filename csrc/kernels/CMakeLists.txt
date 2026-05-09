@@ -46,6 +46,13 @@ function(svdquant_add_kernel_pod name)
         ascendc_include_directories(svdquant_${name}_device PRIVATE
             "${PTO_INCLUDE_DIR}"
             "${PTO_INCLUDE_DIR}/common"
+            # The device source can include the pod's public C header
+            # (for the params struct definition) and svdquant/tensor.h
+            # transitively. We mirror the host OBJECT lib's include
+            # tree here since ascendc_include_directories doesn't
+            # inherit from the host target.
+            "${_root}/include"
+            "${CMAKE_SOURCE_DIR}/csrc/common/include"
         )
         # Host OBJECT lib pulls in the ascendc-built device static lib
         # so downstream linkers don't need to know about it.
