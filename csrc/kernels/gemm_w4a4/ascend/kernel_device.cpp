@@ -1,24 +1,38 @@
 // gemm_w4a4 — Ascend __aicore__ device kernel.
 //
-// Phase 2b (current): cube fp16 mock GEMM into a 6-slot GM ring.
-//   - AIC reads `act` ([Tile_M, Tile_K] half row-major) and `wgt`
-//     ([Tile_N, Tile_K] half row-major, viewed as [Tile_K, Tile_N]
-//     col-major for the NT-layout cube macro), runs the K-loop via
-//     pto_macro_matmul (fp16 inputs → fp32 acc in L0C), TSTOREs the
-//     fp32 result to slot 0 of `out` ([Tile_M, Tile_N] fp32 → backed
-//     by an over-allocated [kRingSlots, Tile_M, Tile_N] buffer in
-//     `params.out` so Phase 2d can rotate slots without reallocating).
-//   - AIV exits silently. Phase 2c will turn it into a TROWEXPANDMUL +
-//     TADD consumer that rescales each cube tile by a constant; for
-//     now the validation strategy is "host reads slot 0 directly and
-//     compares to `act @ wgt.T`".
+// Phase 2c (current): cube fp16 mock GEMM + vec mock dequant consumer.
+//   - AIC: same as Phase 2b — reads `act` ([Tile_M, Tile_K] half row-
+//     major) and `wgt` ([Tile_N, Tile_K] half row-major, NT-viewed),
+//     runs the K-loop via pto_macro_matmul (fp16 in → fp32 acc),
+//     TSTOREs the fp32 result to slot 0 of the GM ring. New: signals
+//     CUBE_TILE_READY via FFTS (PIPE_FIX, mode 0x2 = subblock-broadcast)
+//     so both AIV subblocks unblock with one cube-side signal — same
+//     pattern as FA's compute_pv → UPDATE_READY → compute_gu.
+//   - AIV: 1:2 mix mode = 2 vec subblocks per cube. Each subblock
+//     handles M / kAivPerAic rows (Vec_M = 32) — FA's compute_gu
+//     row-split convention. Per subblock:
+//       wait_flag_dev(CUBE_TILE_READY)
+//       TLOAD(runningOTile, ring_slot0[Vec_M*sid : Vec_M*(sid+1)])
+//       TLOAD(estTile,      ring_slot0[Vec_M*sid : Vec_M*(sid+1)])
+//       TLOAD(scaleTile,    scale_buf[Vec_M*sid : Vec_M*(sid+1)])
+//       runningOTile = TROWEXPANDMUL(runningOTile, scaleTile)
+//       runningOTile = TADD(runningOTile, estTile)
+//       TSTORE(vec_out[Vec_M*sid : Vec_M*(sid+1)], runningOTile)
+//     Mock math: vec_out = K * scale + K = 128*0.5 + 128 = 192.
+//   - The mock scale (0.5) is hardcoded in the AIV branch via
+//     TEXPANDS — we don't ship a GM scale buffer because PTO's TLOAD
+//     can't pull a ColMajor reduce tile out of ND GM (only ND2ND /
+//     DN2DN / NZ2NZ are supported). FA never loads reduce tiles from
+//     GM either; they're produced by software reduce ops. Phase 3's
+//     real dequant scale will be derived from ascales × wscales
+//     in-tile, so the GM-buffer route never actually pays off for us.
+//     `out` is host-over-allocated to hold the [kRingSlots, Tile_M,
+//     Tile_N] cube ring **plus** a final [Tile_M, Tile_N] vec_out
+//     segment right after it.
 //
-// Phase 2a's cube↔vec FFTS handshake is intentionally removed at this
-// stage: the cube does not need to notify the vec yet, and forcing
-// the vec to wait for a non-existent producer signal would deadlock
-// once the AIV body is filled in. The MIX_AIC_1_2 plumbing established
-// in Phase 2a (auto-injected ffts_addr + set_ffts_base_addr in the
-// auto-gen wrapper) stays — we'll rebuild on it in Phase 2c.
+// FFTS counter semantics (matching FA): cube does *one* signal with
+// mode 0x2; the hardware decrements the per-subblock counter for both
+// vec subblocks of the cluster, so cube ↔ vec is 1:N broadcast.
 //
 // Tile sizes are intentionally small (64×128×128) — the goal is to
 // get cube K-loop + L0 ping-pong + FIX-pipe TSTORE plumbing right,
@@ -61,8 +75,15 @@ enum GemmFftsFlag : uint16_t {
 struct DeviceParams {
     __gm__ half*  act;   // [Tile_M, Tile_K] half row-major
     __gm__ half*  wgt;   // [Tile_N, Tile_K] half row-major (NT-viewed)
-    __gm__ float* out;   // [kRingSlots, Tile_M, Tile_N] fp32 ring
+    __gm__ float* out;   // [kRingSlots, Tile_M, Tile_N] cube ring,
+                         // immediately followed by a [Tile_M, Tile_N]
+                         // fp32 vec_out segment for AIV's TSTORE.
 };
+
+// Phase 2c mock dequant scale; baked into the kernel (TEXPANDS) since
+// it's a single fp32 constant. Phase 3 derives the real per-row scale
+// from ascales × wscales at tile granularity, in-tile.
+constexpr float kVecScale = 0.5f;
 
 // Mock-stage cube tile shape. Phase 2b is one iteration: AIC produces
 // one [Tile_M, Tile_N] tile and writes it to slot 0 of the ring.
@@ -176,6 +197,13 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         GlobalOut cGlobal(out_gm);
         TSTORE(cGlobal, cAccTile);
 
+        // Notify AIV that slot 0 is ready. PIPE_FIX = "after the FIX
+        // pipe (TSTORE's pipe) drains"; mode 0x2 = subblock-broadcast,
+        // so a single signal here decrements the counter for *both*
+        // vec subblocks in this cluster — same trick FA uses for
+        // UPDATE_READY between compute_pv and compute_gu.
+        ffts_cross_core_sync(PIPE_FIX, pto::getFFTSMsg(0x2, CUBE_TILE_READY));
+
         // Drain the L0 K-loop pingpong flags so the kernel exits
         // clean — the K-loop did one set_flag(PIPE_M, PIPE_MTE1, *)
         // per iteration, the seed loop above did two; balance.
@@ -183,11 +211,87 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
     }
 
-    // AIV branch is intentionally empty at Phase 2b — the validator
-    // reads slot 0 of the ring back to host directly. Phase 2c will
-    // turn this into a TROWEXPANDMUL + TADD consumer.
+    // AIV — mock dequant consumer. Two subblocks share a cluster;
+    // each handles half the M dimension (kVecM = kTileM / kAivPerAic
+    // = 32). Reads slot 0 of the GM ring (cube fp32 output), multiplies
+    // each row by a per-row constant (= 0.5 from scale_buf), adds the
+    // raw cube tile back as a stand-in for a residual, and TSTOREs to
+    // the vec_out segment of the same `out` buffer.
     if ASCEND_IS_AIV {
-        (void)params_addr;
-        (void)kAivPerAic;
+        constexpr uint32_t kVecM = kTileM / kAivPerAic;
+        const uint32_t subblockid = get_subblockid();
+
+        auto* p = (__gm__ const DeviceParams*)params_addr;
+        auto* out_gm = p->out;
+
+        // Layout of `out_gm`:
+        //   [0 .. kRingSlots * kTileM * kTileN)         cube ring (Phase 2b)
+        //   [kRingSlots*kTileM*kTileN .. that + kTileM*kTileN)
+        //                                                vec_out (Phase 2c)
+        // Slot 0 starts at offset 0; vec_out base sits right after the ring.
+        constexpr uint32_t kVecOutBaseElems = kRingSlots * kTileM * kTileN;
+        const uint32_t row_off_elems = kVecM * kTileN * subblockid;
+
+        auto* cube_slot0_gm = out_gm + row_off_elems;
+        auto* vec_out_gm    = out_gm + kVecOutBaseElems + row_off_elems;
+
+        // UB tile types — FA's compute_gu pattern: per-tile fp32
+        // [Vec_M, N], plus a per-row reduce tile [Vec_M, 1] for the
+        // TROWEXPANDMUL scale. No SLayout; vec tiles don't have sub-
+        // fractal layout. The reduce tile is filled in-tile via
+        // TEXPANDS rather than TLOADed from GM (PTO's TLOAD doesn't
+        // accept ColMajor reduce dst from ND src).
+        using TileVecF = pto::Tile<pto::TileType::Vec, float, kVecM, kTileN,
+                                    pto::BLayout::RowMajor, kVecM, kTileN>;
+        using TileReduceF = pto::Tile<pto::TileType::Vec, float, kVecM, 1,
+                                       pto::BLayout::ColMajor, kVecM, 1>;
+
+        TileVecF runningOTile;
+        TileVecF estTile;
+        TileReduceF scaleTile;
+
+        // UB offsets within the per-subblock UB. UB is per-subblock, so
+        // these offsets are private — no need to stagger by subblockid.
+        // Each TileVecF = 32*128*4 = 16 KB; reduce tile = 32*4 = 128 B.
+        constexpr uint32_t kRunningOff = 0;
+        constexpr uint32_t kEstOff     = kVecM * kTileN * 4;            // 16 KB
+        constexpr uint32_t kScaleOff   = kEstOff + kVecM * kTileN * 4;  // 32 KB
+        TASSIGN(runningOTile, kRunningOff);
+        TASSIGN(estTile,      kEstOff);
+        TASSIGN(scaleTile,    kScaleOff);
+
+        using GlobalSrc = pto::GlobalTensor<float,
+            pto::Shape<1, 1, 1, kVecM, kTileN>,
+            pto::Stride<1, 1, 1, kTileN, 1>>;
+
+        GlobalSrc cubeSlot0(cube_slot0_gm);
+        GlobalSrc estSrc(cube_slot0_gm);   // mock: reload same cube tile
+        GlobalSrc vecOutGlobal(vec_out_gm);
+
+        // Block until cube has TSTOREd slot 0. mode-0x2 broadcast — both
+        // subblocks unblock from the cube's single signal.
+        wait_flag_dev(CUBE_TILE_READY);
+
+        TLOAD(runningOTile, cubeSlot0);
+        TLOAD(estTile,      estSrc);
+
+        // Fill scaleTile with kVecScale (0.5) on the V pipe — no GM,
+        // no MTE2 dependency for this tile.
+        pto::TEXPANDS(scaleTile, kVecScale);
+
+        // MTE2 (loads done) → V (vector compute on running/est).
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+        // runningOTile = runningOTile * scale_per_row
+        pto::TROWEXPANDMUL(runningOTile, runningOTile, scaleTile);
+        // runningOTile = runningOTile + estTile
+        pto::TADD(runningOTile, runningOTile, estTile);
+
+        // V → MTE3 (TSTORE).
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+
+        TSTORE(vecOutGlobal, runningOTile);
     }
 }
