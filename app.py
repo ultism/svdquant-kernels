@@ -1,22 +1,26 @@
-"""Gradio frontend for the svdquant-kernels NPU smoke.
+"""Gradio frontend for the svdquant-kernels NPU op extension test.
 
-Container-as-health-check semantics. On Space startup, before launching
-the gradio webui, we link the pre-cross-built aarch64 .o files in
-``space/objects/`` and run the resulting smoke binary. The full output
-is dumped to stdout so the Space's container log keeps the trace
-regardless of webui state.
+Phase 2f deployment flow on GitCode Space 910B:
 
-If the smoke fails, the process exits non-zero — the Space sees a
-crashed container and surfaces it; no webui ever starts. This matches
-the user's "serverless-style" expectation where you read errors from
-the log panel, not by clicking around in a UI that may not even render.
+  1. Container boot → app.py imports.
+  2. Run `space/link_op_extension.sh` to compile + link
+     `libop_extension.so` from pre-cross-built host_stub + kernel
+     .o files plus the one host wrapper source. Links against the
+     container's native torch + torch_npu (Space image carries them).
+  3. `import op_extension` loads the .so, registering
+     `torch.ops.svdquant.gemm_w4a4`.
+  4. Launch pytest tests/ to drive the op end-to-end against
+     baseline reference; capture stdout.
+  5. Always launch the Gradio webui so the captured trace lives in
+     a Textbox even when tests fail (otherwise GitCode's log panel
+     blanks out once the container exits — see memory note
+     `feedback_space_log_panel_blanks_on_exit.md`).
 
-If the smoke succeeds, the gradio webui starts with the captured output
-already shown in a Textbox, plus a Re-run button for retries.
-
-The smoke binary self-identifies which phase it's testing (1b launch
-path, 2a cube/vec dispatch, 2b cube fp16 mock GEMM, …); this app.py
-is phase-agnostic and just propagates exit codes + stdout.
+Phase 2e's smoke_main C++ flow (link_smoke.sh + standalone smoke ELF +
+.bin argv shuffle) is fully retired by this script. Phase 3 keeps this
+boot scaffolding unchanged; only the op signature in
+`csrc/python/host/svdquant_w4a4_op.cpp` and the test in
+`tests/test_gemm_w4a4.py` extend.
 """
 
 from __future__ import annotations
@@ -25,58 +29,14 @@ import os
 import shlex
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import gradio as gr
-import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 SPACE = ROOT / "space"
-LINK_SCRIPT = SPACE / "link_smoke.sh"
-SMOKE_BIN = SPACE / "svdquant_gemm_w4a4_smoke"
-
-# Phase 2e tile dims — must match kernel_device.cpp / smoke_main.cpp
-PHASE2E_M = 64
-PHASE2E_K = 128
-PHASE2E_N = 128
-PHASE2E_VEC_SCALE = 0.5
-
-# Persistent scratch dir for the act/wgt/ref .bin files. /tmp is fine
-# on the Space container; we keep them around between rerun() calls so
-# the deterministic seed gives byte-identical inputs across retries.
-DATA_DIR = Path(tempfile.gettempdir()) / "svdquant_phase2e"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-ACT_BIN = DATA_DIR / "act.bin"
-WGT_BIN = DATA_DIR / "wgt.bin"
-REF_BIN = DATA_DIR / "ref.bin"
-
-
-def prepare_phase2e_inputs() -> str:
-    """Generate act/wgt fp16 + ref fp32, dump as raw little-endian .bin.
-
-    Imports `baseline.kernels.gemm_w4a4.ref_mock` lazily so a missing
-    baseline package surfaces with a clear traceback in the smoke log
-    (rather than at module load and obscuring everything else).
-    """
-    sys.path.insert(0, str(ROOT))
-    from baseline.kernels.gemm_w4a4.ref_mock import make_inputs, mock_gemm
-
-    act, wgt = make_inputs(PHASE2E_M, PHASE2E_K, PHASE2E_N)
-    ref = mock_gemm(act, wgt, scale=PHASE2E_VEC_SCALE).astype(np.float32)
-
-    ACT_BIN.write_bytes(act.tobytes())
-    WGT_BIN.write_bytes(wgt.tobytes())
-    REF_BIN.write_bytes(ref.tobytes())
-
-    return (
-        f"[phase2e] inputs ready in {DATA_DIR}: "
-        f"act fp16 [{PHASE2E_M},{PHASE2E_K}] {ACT_BIN.stat().st_size}B, "
-        f"wgt fp16 [{PHASE2E_N},{PHASE2E_K}] {WGT_BIN.stat().st_size}B, "
-        f"ref fp32 [{PHASE2E_M},{PHASE2E_N}] {REF_BIN.stat().st_size}B "
-        f"(ref stats: min={ref.min():.3f} max={ref.max():.3f} "
-        f"mean={ref.mean():.3f} std={ref.std():.3f})"
-    )
+LINK_SCRIPT = SPACE / "link_op_extension.sh"
+OP_EXT_SO = SPACE / "objects" / "libop_extension.so"
 
 
 def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str]:
@@ -87,57 +47,77 @@ def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str]:
             cwd=str(cwd) if cwd else None,
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=300,
         )
     except FileNotFoundError as e:
         return 127, f"$ {pretty}\nFileNotFoundError: {e}\n"
     except subprocess.TimeoutExpired:
-        return 124, f"$ {pretty}\n<<timed out after 180s>>\n"
-    out = f"$ {pretty}\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}\nexit: {proc.returncode}\n"
+        return 124, f"$ {pretty}\n<<timed out after 300s>>\n"
+    out = (
+        f"$ {pretty}\n--- stdout ---\n{proc.stdout}\n"
+        f"--- stderr ---\n{proc.stderr}\nexit: {proc.returncode}\n"
+    )
     return proc.returncode, out
 
 
 def _step(log: list[str], msg: str) -> None:
-    """Stream-print so the container log keeps progress even if the
-    container dies mid-pipeline. INITIAL_OUTPUT is printed at the end
-    too (for the Gradio textbox), but this is the source of truth
-    while the run is in flight."""
+    """Stream-print so the container log keeps progress mid-flight.
+
+    Necessary because GitCode's log panel blanks out as soon as the
+    container exits — buffered output won't reach it. See
+    `feedback_space_log_panel_blanks_on_exit.md`.
+    """
     print(msg, flush=True)
     log.append(msg)
 
 
-def link_then_run() -> tuple[bool, str]:
+def link_then_test() -> tuple[bool, str]:
     import traceback
     log: list[str] = []
     _step(log, f"[boot] ASCEND_HOME_PATH={os.environ.get('ASCEND_HOME_PATH', '<unset>')}")
-    _step(log, f"[boot] smoke binary present: {SMOKE_BIN.exists()}")
-    if not SMOKE_BIN.exists():
-        _step(log, "[boot] linking smoke binary...")
-        try:
-            os.chmod(LINK_SCRIPT, 0o755)
-        except OSError:
-            pass
-        rc, out = _run(["bash", str(LINK_SCRIPT)])
-        _step(log, out)
-        if rc != 0:
-            _step(log, "[FAIL] link step returned non-zero")
-            return False, "\n".join(log)
+    _step(log, f"[boot] op_extension .so present: {OP_EXT_SO.exists()}")
 
-    _step(log, "[boot] preparing Phase 2e inputs (numpy mock_gemm → /tmp/.bin)...")
+    # Always re-link to pick up source/object changes; setuptools-style
+    # mtime caching can come later. Link is ~5 s for one .cpp.
+    _step(log, "[boot] linking libop_extension.so...")
     try:
-        _step(log, prepare_phase2e_inputs())
-    except Exception as e:
-        _step(log, f"[FAIL] prepare_phase2e_inputs: {e!r}")
-        _step(log, traceback.format_exc())
+        os.chmod(LINK_SCRIPT, 0o755)
+    except OSError:
+        pass
+    rc, out = _run(["bash", str(LINK_SCRIPT)])
+    _step(log, out)
+    if rc != 0:
+        _step(log, "[FAIL] link step returned non-zero")
         return False, "\n".join(log)
 
-    _step(log, "[boot] running smoke binary with argv = act/wgt/ref paths...")
-    rc, out = _run([str(SMOKE_BIN), str(ACT_BIN), str(WGT_BIN), str(REF_BIN)])
-    _step(log, out)
-    if rc == 0:
-        _step(log, "[OK] kernel launched and stream synced")
+    _step(log, "[boot] running pytest tests/...")
+    # PYTHONPATH adds csrc/python so `import op_extension` resolves.
+    env = dict(os.environ)
+    env["PYTHONPATH"] = (
+        f"{ROOT / 'csrc' / 'python'}:{ROOT}:" + env.get("PYTHONPATH", "")
+    )
+    pytest_cmd = [sys.executable, "-m", "pytest", "-v", "-s",
+                  str(ROOT / "tests")]
+    pretty = " ".join(shlex.quote(c) for c in pytest_cmd)
+    try:
+        proc = subprocess.run(
+            pytest_cmd, env=env, capture_output=True, text=True, timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        _step(log, f"$ {pretty}\n<<pytest timed out after 300s>>")
+        return False, "\n".join(log)
+    _step(log, f"$ {pretty}\n--- stdout ---\n{proc.stdout}\n"
+                f"--- stderr ---\n{proc.stderr}\nexit: {proc.returncode}\n")
+    if proc.returncode == 0:
+        _step(log, "[OK] all tests passed")
         return True, "\n".join(log)
-    _step(log, f"[FAIL] smoke exited {rc}")
+
+    _step(log, f"[FAIL] pytest exited {proc.returncode}")
+    try:
+        # Surface any uncaught exception in the test module.
+        traceback.print_exc()
+    except Exception:
+        pass
     return False, "\n".join(log)
 
 
@@ -148,36 +128,31 @@ def _print_banner(title: str) -> None:
     print(bar, flush=True)
 
 
-# === Run smoke before launching the webui ===
-# We still launch the webui even on smoke failure so the captured
-# output is reachable via the Gradio textbox — empirically GitCode's
-# log panel returns "暂无日志" once the container exits, so a hard
-# sys.exit hides the very trace we need to debug. The textbox makes
-# the full trace visible regardless of container lifecycle.
-_print_banner("svdquant-kernels NPU smoke — running before webui")
-ok, INITIAL_OUTPUT = link_then_run()
-_print_banner("smoke OK" if ok else "smoke FAILED — webui still starts so trace is visible")
+# === Run link + tests before launching the webui ===
+_print_banner("svdquant-kernels op_extension — link + pytest")
+_OK, INITIAL_OUTPUT = link_then_test()
+_print_banner("tests OK" if _OK else "tests FAILED — webui still starts so trace is visible")
 
 
 def rerun() -> str:
-    _, txt = link_then_run()
+    _, txt = link_then_test()
     return txt
 
 
-with gr.Blocks(title="svdquant-kernels — Ascend 910B NPU smoke") as demo:
+with gr.Blocks(title="svdquant-kernels — Ascend 910B torch.ops.svdquant.gemm_w4a4") as demo:
     gr.Markdown(
-        "# svdquant-kernels — Ascend 910B NPU smoke\n"
-        "Cross-built locally on x86_64 (CANN 8.5), final link runs on this 910B "
-        "container. The smoke binary itself reports which phase is being "
-        "tested in its stdout; this UI is just a viewer.\n\n"
-        "Smoke ran on container startup; output captured below. If it had "
-        "failed, this webui would never have started — the Space's log panel "
-        "would have the trace instead."
+        "# svdquant-kernels — Ascend 910B `torch.ops.svdquant.gemm_w4a4`\n"
+        "Phase 2f: link `libop_extension.so` from pre-cross-built device + "
+        "host-launcher .o files plus the torch op wrapper source, register the op "
+        "via `TORCH_LIBRARY_IMPL(svdquant, PrivateUse1, m)`, then run pytest. "
+        "Boot output is captured below; if tests fail, this webui still "
+        "starts so the trace stays reachable."
     )
-    out = gr.Textbox(label="Output", lines=24, max_lines=60, value=INITIAL_OUTPUT)
-    btn = gr.Button("Re-run")
+    out = gr.Textbox(label="Output", lines=24, max_lines=80, value=INITIAL_OUTPUT)
+    btn = gr.Button("Re-run link + tests")
     btn.click(fn=rerun, inputs=None, outputs=out)
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("GRADIO_SERVER_PORT", "7860")))
+    demo.launch(server_name="0.0.0.0",
+                server_port=int(os.environ.get("GRADIO_SERVER_PORT", "7860")))

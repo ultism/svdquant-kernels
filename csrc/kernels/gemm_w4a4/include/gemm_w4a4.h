@@ -32,40 +32,32 @@
 //   qout         [M, N/2]     uint8     (optional) pre-quantized output for next layer
 //   oscales      [N/64, M]    fp16      (optional) matching scales for `qout`
 //
-// Reference: `tmp/nunchaku/src/kernels/zgemm/gemm_w4a4.cu:34-105`
-// (the `gemm_w4a4` host launcher; we intentionally omit nunchaku's
-// attention-fusion parameters — norm/rotary/QKV-split belong to the
-// attention kernel, not the linear).
+// Reference: `tmp/nunchaku/src/kernels/zgemm/gemm_w4a4.cu:34-105`.
+//
+// Phase 2f signature: raw device pointers + `void* stream`, no struct
+// wrapper. The torch op extension (`csrc/python/host/svdquant_w4a4_op.cpp`)
+// calls this directly with `at::Tensor.storage().data()` pointers and
+// the current NPU stream from `c10_npu::getCurrentNPUStream`. Phase 2d
+// device kernel still uses constexpr tile sizes (64×128×128, ring=6,
+// num_tiles=8); the dims are not yet parameters here because the
+// device kernel doesn't accept them yet — Phase 3 will add ascales /
+// wscales / lora_* and parameterize.
 
-#include "svdquant/tensor.h"
+namespace svdquant::ascend {
 
-namespace svdquant {
+// Phase 2f — fp16 mock interface (matches Phase 2d kernel_device.cpp).
+//   act:    [kTileM, kTileK]                        fp16  device pointer
+//   wgt:    [kTileK, kTileN]                        fp16  device pointer
+//   out:    [(kRingSlots + kNumTiles), kTileM, kTileN] fp32 device pointer
+//             - first kRingSlots × M × N            cube ring scratch
+//             - next  kNumTiles  × M × N            vec_out (final result)
+//   stream: aclrtStream cast to void* (kept opaque so this header
+//           doesn't drag in CANN headers; the .cpp casts back).
+//
+// Caller (the torch op wrapper) is responsible for allocating `out`
+// large enough for both the cube ring and the linear vec_out region.
+// Synchronization is the caller's responsibility — the launcher
+// returns immediately after `aclrtlaunch_*` issues the kernel.
+void gemm_w4a4(void* act, void* wgt, void* out, void* stream);
 
-struct GemmW4A4Params {
-    // Inputs
-    TensorRef act;
-    TensorRef wgt;
-    TensorRef ascales;
-    TensorRef wscales;
-
-    // Low-rank residual
-    TensorRef lora_act_in;
-    TensorRef lora_up;
-
-    // Optional per-channel affine on the main output
-    TensorRef bias;       // may be .data == nullptr
-    float     alpha;      // per-tensor weight scale multiplier
-
-    // Main output
-    TensorRef out;
-
-    // Optional fused next-layer quantize (produces inputs for the
-    // next gemm_w4a4). All three must be valid together or all null.
-    TensorRef qout;
-    TensorRef oscales;
-    TensorRef smooth;
-};
-
-namespace ascend { void gemm_w4a4(const GemmW4A4Params& p, void* stream); }
-
-}  // namespace svdquant
+}  // namespace svdquant::ascend
