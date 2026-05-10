@@ -75,7 +75,10 @@ at::Tensor run_gemm_w4a4(const at::Tensor& act,
     // Workspace = cube/vec hand-off ring of int32 partials. Caching
     // allocator keeps re-alloc cost ~free across calls. Lifetime
     // ends with this `at::Tensor` going out of scope at function exit.
-    auto workspace = at::empty(
+    // Use zeros (not empty) so stale garbage can't masquerade as a
+    // cube-written partial if a slot is read before it's filled —
+    // makes "vec read garbage" visible as zero output rather than inf.
+    auto workspace = at::zeros(
         {kPhase3aRingSlots, kPhase3aM, kPhase3aN}, i32_options);
     auto out = at::empty({kPhase3aM, kPhase3aN}, fp16_options);
 

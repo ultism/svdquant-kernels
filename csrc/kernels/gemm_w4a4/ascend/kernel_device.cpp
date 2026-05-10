@@ -260,33 +260,31 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         const uint32_t row_off    = kVecM * subblockid;  // 0 or 64
 
         // UB layout (per AIV subblock; TOTAL_VEC_LOCAL_SIZE = 184 KB on
-        // dav_c220 mix mode — distinct from the 248 KB TOTAL_UB_SIZE,
-        // which only applies in pure-vector mode):
-        //   partial          [vecM=64, BN=256] i32/f32 overlap  = 64 KB @ 0
-        //   running_f32      [vecM=64, BN=256] f32              = 64 KB @ 64 KB
-        //   ascale_f16       [vecM=64]         f16              = 128 B @ 128 KB
-        //   ascale_f32       [vecM=64]         f32              = 256 B @ 128 KB + 256
-        //   wscale_f16       [BN=256]          f16              = 512 B @ 128 KB + 1 KB
-        //   wscale_f32       [BN=256]          f32              = 1 KB  @ 128 KB + 2 KB
-        //   out_f16          [vecM=64, BN=256] f16              = 32 KB @ 0  (overlaps `partial`,
-        //                                                                    used only after the
-        //                                                                    last K-block when
-        //                                                                    `partial` is dead)
-        // Total live ≈ 128 KB + 2 KB = 130 KB / 184 KB. Two buffer
-        // overlaps:
-        //   * partial_i32 and partial_f32 share offset 0 — TLOAD writes
-        //     int32 bytes; the next TCVT reads those same bytes via a
-        //     fp32 Tile view at the same offset, in-place. PTO TCVT is
-        //     element-wise so src==dst is safe.
-        //   * out_f16 overlaps with `partial` because by the post-loop
-        //     epilogue the partial buffer is no longer read.
-        constexpr uint32_t kPartialOff   = 0;
-        constexpr uint32_t kRunningOff   = kPartialOff + kVecM * kBN * 4;
-        constexpr uint32_t kAscaleF16Off = kRunningOff + kVecM * kBN * 4;
-        constexpr uint32_t kAscaleF32Off = kAscaleF16Off + kVecM * 2;
-        constexpr uint32_t kWscaleF16Off = kAscaleF32Off + kVecM * 4;
-        constexpr uint32_t kWscaleF32Off = kWscaleF16Off + kBN * 2;
-        constexpr uint32_t kOutF16Off    = kPartialOff;  // overlap, see above
+        // dav_c220 mix mode):
+        //   partial_i32      [vecM, BN]       i32  =  vecM*BN*4 bytes  @ 0
+        //   partial_f32      [vecM, BN]       f32  =  vecM*BN*4 bytes  after partial_i32
+        //   running_f32      [vecM, BN]       f32  =  vecM*BN*4 bytes  after partial_f32
+        //   ascale_f16/_f32  [vecM, 1]        f16/f32   small          after running
+        //   wscale_f16/_f32  [1, BN]          f16/f32   small          after ascale
+        //   out_f16          [vecM, BN]       f16  =  vecM*BN*2 bytes  @ 0  (overlaps
+        //                                                                  partial_i32 — written
+        //                                                                  only after the K-loop
+        //                                                                  ends, so partial is
+        //                                                                  dead at that point)
+        //
+        // Earlier revision overlapped partial_i32 and partial_f32 at the
+        // same UB offset for in-place TCVT. PTO TCVT may not be safe in-
+        // place even though it's element-wise — disjoint offsets remove
+        // that ambiguity. For starter tile (vecM=32 BN=128), live UB ≈
+        // 3 × 16 KB + 2 KB ≈ 50 KB ≪ 184 KB, so the cost is negligible.
+        constexpr uint32_t kPartialI32Off = 0;
+        constexpr uint32_t kPartialF32Off = kPartialI32Off + kVecM * kBN * 4;
+        constexpr uint32_t kRunningOff    = kPartialF32Off + kVecM * kBN * 4;
+        constexpr uint32_t kAscaleF16Off  = kRunningOff + kVecM * kBN * 4;
+        constexpr uint32_t kAscaleF32Off  = kAscaleF16Off + kVecM * 2;
+        constexpr uint32_t kWscaleF16Off  = kAscaleF32Off + kVecM * 4;
+        constexpr uint32_t kWscaleF32Off  = kWscaleF16Off + kBN * 2;
+        constexpr uint32_t kOutF16Off     = kPartialI32Off;  // overlap with partial_i32 post-loop
 
         using TilePartialI32 = pto::Tile<pto::TileType::Vec, int32_t, kVecM, kBN,
                                           pto::BLayout::RowMajor, kVecM, kBN>;
@@ -353,13 +351,8 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             TileAscaleF32  ascaleF32;
             TileWscaleF16  wscaleF16;
             TileWscaleF32  wscaleF32;
-            // partI32 and partF32 share the same UB offset on purpose:
-            // TLOAD writes int32 bytes there; the subsequent TCVT
-            // re-reads those bytes via a fp32 view at the same offset
-            // (in-place i32→f32 cast). PTO TCVT is element-wise on
-            // the vec pipe so src==dst is safe and saves 64 KB of UB.
-            TASSIGN(partI32,   kPartialOff);
-            TASSIGN(partF32,   kPartialOff);
+            TASSIGN(partI32,   kPartialI32Off);
+            TASSIGN(partF32,   kPartialF32Off);
             TASSIGN(running,   kRunningOff);
             TASSIGN(ascaleF16, kAscaleF16Off);
             TASSIGN(ascaleF32, kAscaleF32Off);
