@@ -103,8 +103,41 @@ class TestGemmW4A4Phase3aInt4(unittest.TestCase):
         self.assertEqual(out.dtype, torch.float16)
 
         _step("  comparing to ref")
+        out_cpu = out.cpu()
+
+        # Diagnostic prints — eyeball the mismatch class before assert_close
+        # gives only the first failing entry. The shape of the disagreement
+        # (factor-of-2 / sign / NaN / transposed / row-or-col-invariant) is
+        # what tells layout bugs apart from scale-offset bugs.
+        _step(f"  ref [0,:8] = {ref[0, :8].tolist()}")
+        _step(f"  out [0,:8] = {out_cpu[0, :8].tolist()}")
+        _step(f"  ref [1,:8] = {ref[1, :8].tolist()}")
+        _step(f"  out [1,:8] = {out_cpu[1, :8].tolist()}")
+        _step(f"  ref col0 [:8] = {ref[:8, 0].tolist()}")
+        _step(f"  out col0 [:8] = {out_cpu[:8, 0].tolist()}")
+
+        diff = (out_cpu.float() - ref.float())
+        rel = diff.abs() / (ref.float().abs() + 1e-6)
+        _step(
+            f"  diff: max_abs={diff.abs().max().item():.4f} "
+            f"mean_abs={diff.abs().mean().item():.4f} "
+            f"max_rel={rel.max().item():.4f} "
+            f"any_nan={out_cpu.isnan().any().item()}"
+        )
+        # Invariant probes:
+        #   * if y[m, n] is essentially independent of n → cube is collapsing
+        #     N axis (likely B-side fractal layout error or wscale broadcast
+        #     hitting all N).
+        #   * if y[m, n] is essentially independent of m → A-side analogous.
+        out_n_var = out_cpu.float().std(dim=1).mean().item()
+        out_m_var = out_cpu.float().std(dim=0).mean().item()
+        _step(
+            f"  out variability: along_n_per_row={out_n_var:.4f} "
+            f"along_m_per_col={out_m_var:.4f}"
+        )
+
         torch.testing.assert_close(
-            out.cpu(), ref, rtol=5e-2, atol=5e-2,
+            out_cpu, ref, rtol=5e-2, atol=5e-2,
             msg="phase 3a int4 main-path output diverged from baseline ref",
         )
         _step("test_phase3a_int4_main_path: pass")
