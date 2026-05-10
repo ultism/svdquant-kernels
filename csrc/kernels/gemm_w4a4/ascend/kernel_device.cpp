@@ -441,6 +441,32 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
 
             // partF32[m,n] *= ascaleF32[m]
             pto::TROWEXPANDMUL(partF32, partF32, ascaleF32);
+
+            // 3a-bisect-4: snapshot partF32 right after TROWEXPANDMUL and
+            // before TCOLEXPANDMUL into unused workspace slots 4/5
+            // (reinterpreted as fp32). Day 4 finding: out[0,:] EXACTLY
+            // matches ref[0,:] but out[1+,:] ≈ 0. Each AIV writes its own
+            // row band [row_off, row_off+kVecM); if TROWEXPANDMUL only
+            // applied row 0 of its [32, 128] tile, this dump shows
+            // ws[4][0,:] correctly = ws[0].float()[0,:] * ascale[0,0] but
+            // ws[4][1:32, :] either stale or = ws[0].float()[1:32, :]
+            // (unscaled).
+            if (kb < 2u) {
+                using GlobalDebug2F32 = pto::GlobalTensor<float,
+                    pto::Shape<1, 1, 1, kVecM, kBN>,
+                    pto::Stride<1, 1, 1, kBN, 1>>;
+                auto* ws_f32 = reinterpret_cast<__gm__ float*>(ws_gm);
+                const uint64_t debug2_off =
+                    (uint64_t)(kb + 4) * kBM * kBN + (uint64_t)row_off * kBN;
+                GlobalDebug2F32 debug2Gm(ws_f32 + debug2_off);
+
+                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+                TSTORE(debug2Gm, partF32);
+                set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+                wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+            }
+
             // partF32[m,n] *= wscaleF32[n]
             pto::TCOLEXPANDMUL(partF32, partF32, wscaleF32);
 

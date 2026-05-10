@@ -184,8 +184,55 @@ class TestGemmW4A4Phase3aInt4(unittest.TestCase):
             f"mean={debug_part0.mean().item():.2f}"
         )
 
+        # ----- 3a-bisect-4: post-TROWEXPANDMUL pre-TCOLEXPANDMUL dump -----
+        # Kernel TSTORE'd `partF32` after `TROWEXPANDMUL(partF32, ascaleF32)`
+        # but before `TCOLEXPANDMUL` into ws slots 4/5 (reinterpreted as
+        # fp32). Expected: ws_f32[4][m, n] = ws[0].float()[m, n] *
+        # ascales[0, m].float() for all m in [0, 64). Day 4 finding:
+        # out[0,:] EXACTLY matches ref[0,:] but rows 1+ are ~0. If
+        # TROWEXPANDMUL only writes row 0 of its [32, 128] sub-tile,
+        # debug_post_row[0,:] should match expected, debug_post_row[1:32, :]
+        # should be either stale or = ws[0].float()[1:32, :] unscaled.
+        # Symmetric check on AIV1's row band [32, 64).
+        debug_post_row0 = ws_f32[4]
+        debug_post_row1 = ws_f32[5]
+        # Expected: per-row scaled partial.
+        ascales_cpu = ascales.float()        # [2, M]
+        wscales_cpu = wscales.float()        # [2, N]
+        ws0_f = ws_cpu[0].float()
+        ws1_f = ws_cpu[1].float()
+        expected_post_row0 = ws0_f * ascales_cpu[0].unsqueeze(1)  # [M, N]
+        expected_post_row1 = ws1_f * ascales_cpu[1].unsqueeze(1)
+        d4_diff0 = (debug_post_row0 - expected_post_row0).abs()
+        d4_diff1 = (debug_post_row1 - expected_post_row1).abs()
+        _step("  vec post-TROWEXPANDMUL dump (workspace slot 4/5 viewed as fp32)")
+        _step(f"  debug_post_row0[0, 0:4] = {debug_post_row0[0, 0:4].tolist()}")
+        _step(f"  expected_post_row0[0, 0:4] = {expected_post_row0[0, 0:4].tolist()}")
+        _step(f"  debug_post_row0[1, 0:4] = {debug_post_row0[1, 0:4].tolist()}")
+        _step(f"  expected_post_row0[1, 0:4] = {expected_post_row0[1, 0:4].tolist()}")
+        _step(f"  debug_post_row0[31, 0:4] = {debug_post_row0[31, 0:4].tolist()}  (last row of AIV0)")
+        _step(f"  debug_post_row0[32, 0:4] = {debug_post_row0[32, 0:4].tolist()}  (AIV1's row 0)")
+        _step(f"  expected_post_row0[32, 0:4] = {expected_post_row0[32, 0:4].tolist()}")
+        _step(f"  debug_post_row0[33, 0:4] = {debug_post_row0[33, 0:4].tolist()}")
+        _step(
+            f"  debug_post_row0 vs expected: max_abs={d4_diff0.max().item():.4f} "
+            f"mean_abs={d4_diff0.mean().item():.4f}"
+        )
+        # Per-row diagnosis — collapse to per-row max diff so we can see
+        # which rows TROWEXPANDMUL actually wrote.
+        per_row_diff0 = d4_diff0.max(dim=1).values
+        _step(f"  debug_post_row0 per-row max_abs: {per_row_diff0.tolist()}")
+        _step(
+            f"  debug_post_row1 vs expected: max_abs={d4_diff1.max().item():.4f} "
+            f"mean_abs={d4_diff1.mean().item():.4f}"
+        )
+
         _step("  comparing to ref")
         out_cpu = out.cpu()
+        _step(f"  out [32,:8] = {out_cpu[32, :8].tolist()}  (AIV1's row 0)")
+        _step(f"  ref [32,:8] = {ref[32, :8].tolist()}")
+        _step(f"  out [33,:8] = {out_cpu[33, :8].tolist()}")
+        _step(f"  ref [33,:8] = {ref[33, :8].tolist()}")
 
         # Diagnostic prints — eyeball the mismatch class before assert_close
         # gives only the first failing entry. The shape of the disagreement
