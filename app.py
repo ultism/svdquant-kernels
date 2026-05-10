@@ -148,16 +148,15 @@ def _print_banner(title: str) -> None:
     print(bar, flush=True)
 
 
-# === Container-as-health-check: run smoke before launching the webui ===
+# === Run smoke before launching the webui ===
+# We still launch the webui even on smoke failure so the captured
+# output is reachable via the Gradio textbox — empirically GitCode's
+# log panel returns "暂无日志" once the container exits, so a hard
+# sys.exit hides the very trace we need to debug. The textbox makes
+# the full trace visible regardless of container lifecycle.
 _print_banner("svdquant-kernels NPU smoke — running before webui")
 ok, INITIAL_OUTPUT = link_then_run()
-print(INITIAL_OUTPUT, flush=True)
-_print_banner("smoke OK" if ok else "smoke FAILED — exiting before webui starts")
-
-if not ok:
-    # Crash the container so the Space log panel keeps the full trace
-    # and the platform shows the run as failed. No webui to obscure it.
-    sys.exit(1)
+_print_banner("smoke OK" if ok else "smoke FAILED — webui still starts so trace is visible")
 
 
 def rerun() -> str:
