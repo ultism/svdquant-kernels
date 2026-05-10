@@ -347,8 +347,24 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         // existent prior TSTORE (drained at the end).
         set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
 
+        // 3a-fix-6: Cross-iter UB sync — partial_i32/f32 region (UB[0,
+        // 16KB)) is reused every iter. iter N's PIPE_V (TROWEXPANDMUL,
+        // TCOLEXPANDMUL, TMOV/TADD) writes partF32 there; iter N+1's
+        // PIPE_MTE2 TLOAD overwrites with new int32 partial. Without a
+        // V→MTE2 sync, MTE2 can fire before V drains, then V's stale
+        // fp32 writes land AFTER and corrupt the freshly-loaded int32
+        // bytes — TCVT then reads fp32 bit patterns as int32 (e.g.
+        // 0.1 = 0x3DCCCCCD = 1.036e9 → fp32 1e9). Diagnosed by
+        // 3a-bisect-3: debug_part1 max_abs ≈ 2^31 (= INT32_MAX) while
+        // ws[1] is in [-505, 474]. Seed satisfies iter 0; subsequent
+        // iters wait for prior iter's PIPE_V to drain.
+        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
+
         for (uint32_t kb = 0; kb < kNumKBlocks; ++kb) {
             wait_flag_dev(CUBE_TILE_READY);
+            // Wait prior iter's PIPE_V (TROWEXPANDMUL/TCOLEXPANDMUL/TMOV)
+            // to drain before this iter's TLOAD overwrites partial UB.
+            wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
             const uint32_t slot = kb % kRingSlots;
 
             // GM offsets:
@@ -437,6 +453,10 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
                 pto::TADD(running, running, partF32);
             }
 
+            // Signal V→MTE2 for the next iter so its TLOAD won't overlap
+            // with this iter's PIPE_V writes to partF32. See seed comment.
+            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
+
             // Free the ring slot for the next cube K-block.
             ffts_cross_core_sync(PIPE_MTE2,
                                   pto::getFFTSMsg(0x2, VEC_TILE_CONSUMED));
@@ -450,6 +470,7 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
 
         // Drain trailing seed before final cast+store.
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
 
         // Final epilogue: f32 → fp16 then TSTORE the AIV's row band.
         TileRunningF32 runningFinal;
