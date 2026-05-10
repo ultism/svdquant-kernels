@@ -73,6 +73,16 @@ class TestGemmW4A4Phase3aInt4(unittest.TestCase):
         act, wgt, ascales, wscales = make_int4_inputs(
             PHASE3A_M, PHASE3A_K, PHASE3A_N
         )
+        # Bisect probe: zero out wgt nibbles. partial_int32 must be 0
+        # everywhere (mad_s4 of anything × 0 = 0), so dequant fp32 = 0,
+        # output = 0. ref (ref_int4 with wgt=zeros) is also all-zero,
+        # so assert_close at rtol=5e-2 atol=5e-2 trivially passes if the
+        # cube→ring→vec→TLOAD pipeline is wired correctly. If output is
+        # still ±inf/NaN, the partial we read in vec is *not* the int32
+        # mad_s4 wrote — the cube TSTORE path is broken or vec is
+        # reading the wrong slot offset.
+        wgt = torch.zeros_like(wgt)
+        _step("  [bisect] zeroed wgt nibbles — expect output ≈ 0")
 
         _step("  building reference (CPU)")
         lora_act_in = torch.zeros(PHASE3A_M, PHASE3A_R, dtype=torch.float32)

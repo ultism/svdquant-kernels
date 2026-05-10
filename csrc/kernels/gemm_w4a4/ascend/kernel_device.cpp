@@ -261,30 +261,26 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
 
         // UB layout (per AIV subblock; TOTAL_VEC_LOCAL_SIZE = 184 KB on
         // dav_c220 mix mode):
-        //   partial_i32      [vecM, BN]       i32  =  vecM*BN*4 bytes  @ 0
-        //   partial_f32      [vecM, BN]       f32  =  vecM*BN*4 bytes  after partial_i32
-        //   running_f32      [vecM, BN]       f32  =  vecM*BN*4 bytes  after partial_f32
-        //   ascale_f16/_f32  [vecM, 1]        f16/f32   small          after running
-        //   wscale_f16/_f32  [1, BN]          f16/f32   small          after ascale
-        //   out_f16          [vecM, BN]       f16  =  vecM*BN*2 bytes  @ 0  (overlaps
-        //                                                                  partial_i32 — written
-        //                                                                  only after the K-loop
-        //                                                                  ends, so partial is
-        //                                                                  dead at that point)
+        //   partial_i32 / partial_f32   shared @ 0           = vecM*BN*4 bytes
+        //   running_f32                 after partial        = vecM*BN*4 bytes
+        //   ascale_f16/_f32             small                after running
+        //   wscale_f16/_f32             small                after ascale
+        //   out_f16                     overlap @ 0          (post-loop, partial dead)
         //
-        // Earlier revision overlapped partial_i32 and partial_f32 at the
-        // same UB offset for in-place TCVT. PTO TCVT may not be safe in-
-        // place even though it's element-wise — disjoint offsets remove
-        // that ambiguity. For starter tile (vecM=32 BN=128), live UB ≈
-        // 3 × 16 KB + 2 KB ≈ 50 KB ≪ 184 KB, so the cost is negligible.
-        constexpr uint32_t kPartialI32Off = 0;
-        constexpr uint32_t kPartialF32Off = kPartialI32Off + kVecM * kBN * 4;
-        constexpr uint32_t kRunningOff    = kPartialF32Off + kVecM * kBN * 4;
-        constexpr uint32_t kAscaleF16Off  = kRunningOff + kVecM * kBN * 4;
-        constexpr uint32_t kAscaleF32Off  = kAscaleF16Off + kVecM * 2;
-        constexpr uint32_t kWscaleF16Off  = kAscaleF32Off + kVecM * 4;
-        constexpr uint32_t kWscaleF32Off  = kWscaleF16Off + kBN * 2;
-        constexpr uint32_t kOutF16Off     = kPartialI32Off;  // overlap with partial_i32 post-loop
+        // partial_i32/f32 share offset 0 on purpose: tried disjoint at
+        // offset 0x4000 and triggered `VEC instruction error: ub address
+        // out of bounds` mid-K-block, identical signature to 3a-fix-3
+        // (commit 0334240) which suspected PTO internal scratch
+        // (TMP_UB_OFFSET) using a fixed low UB offset. In-place TCVT
+        // i32→f32 is safe at the kernel level (PIPE_V is element-wise);
+        // the overlap stays.
+        constexpr uint32_t kPartialOff   = 0;
+        constexpr uint32_t kRunningOff   = kPartialOff + kVecM * kBN * 4;
+        constexpr uint32_t kAscaleF16Off = kRunningOff + kVecM * kBN * 4;
+        constexpr uint32_t kAscaleF32Off = kAscaleF16Off + kVecM * 2;
+        constexpr uint32_t kWscaleF16Off = kAscaleF32Off + kVecM * 4;
+        constexpr uint32_t kWscaleF32Off = kWscaleF16Off + kBN * 2;
+        constexpr uint32_t kOutF16Off    = kPartialOff;  // overlap with partial post-loop
 
         using TilePartialI32 = pto::Tile<pto::TileType::Vec, int32_t, kVecM, kBN,
                                           pto::BLayout::RowMajor, kVecM, kBN>;
@@ -351,8 +347,8 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             TileAscaleF32  ascaleF32;
             TileWscaleF16  wscaleF16;
             TileWscaleF32  wscaleF32;
-            TASSIGN(partI32,   kPartialI32Off);
-            TASSIGN(partF32,   kPartialF32Off);
+            TASSIGN(partI32,   kPartialOff);
+            TASSIGN(partF32,   kPartialOff);  // in-place i32→f32 cast (see UB layout note above)
             TASSIGN(running,   kRunningOff);
             TASSIGN(ascaleF16, kAscaleF16Off);
             TASSIGN(ascaleF32, kAscaleF32Off);
