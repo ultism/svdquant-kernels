@@ -37,6 +37,35 @@ from .._int4 import (
 )
 
 
+def make_int4_inputs(
+    M: int,
+    K: int,
+    N: int,
+    *,
+    seed: int = 0xC0FFEE,
+    amplitude: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Deterministic INT4-packed (act, wgt) + per-K-block fp16 scales.
+
+    Returns `(act_packed, wgt_packed, ascales, wscales)` ready for the
+    AscendC `gemm_w4a4` op:
+        act_packed [M,         K/2]               uint8   nibbles
+        wgt_packed [N,         K/2]               uint8
+        ascales    [K/B, M]                       fp16
+        wscales    [K/B, N]                       fp16
+
+    Amplitude 0.5 matches `ref_mock.make_inputs`. After symmetric INT4
+    quant the recovered fp32 values land in roughly the same dynamic
+    range, so post-MMA magnitudes stay sane for fp16 epilogue casts.
+    """
+    g = torch.Generator().manual_seed(seed)
+    act_fp32 = (torch.rand(M, K, generator=g) * 2 - 1) * amplitude
+    wgt_fp32 = (torch.rand(N, K, generator=g) * 2 - 1) * amplitude
+    act_packed, ascales = quantize_int4_rows(act_fp32, block_size=INT4_BLOCK_SIZE)
+    wgt_packed, wscales = quantize_int4_rows(wgt_fp32, block_size=INT4_BLOCK_SIZE)
+    return act_packed, wgt_packed, ascales, wscales
+
+
 def gemm_w4a4_ref_int4(
     act: torch.Tensor,
     wgt: torch.Tensor,

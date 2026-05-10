@@ -1,29 +1,19 @@
-// torch op binding for `svdquant::gemm_w4a4` — Phase 2f scaffolding.
+// torch op binding for `svdquant::gemm_w4a4` — Phase 3a INT4 main path.
 //
 // Registers a single op into the `svdquant` namespace's PrivateUse1
 // (NPU) dispatch table:
 //
-//   torch.ops.svdquant.gemm_w4a4(act, wgt) -> Tensor
+//   torch.ops.svdquant.gemm_w4a4(act, wgt, ascales, wscales) -> Tensor
 //
-// where `act` and `wgt` are NPU half tensors with the shape that
-// Phase 2d's mock kernel hardcodes (act [64, 128], wgt [128, 128]).
-// Output is fp32 and over-allocated to hold cube ring scratch
-// (kRingSlots × M × N) + linear vec_out (kNumTiles × M × N), matching
-// the exact layout the test harness expects.
+// Inputs are packed signed-INT4 activation + weight + matching per-
+// 64-K-block fp16 scales. Output is fp16 [M, N]. Workspace for the
+// cube/vec int32 ring is allocated here (caching alloc, scoped to
+// the call) and not exposed to the caller.
 //
-// Implementation routes through our existing host launcher
-// `svdquant::ascend::gemm_w4a4(act, wgt, out, stream)`, which internally
-// packs a `DeviceParams` struct + H2D copies it onto the device — that
-// extra step is required because Phase 2d's device kernel signature is
-// `(GM_ADDR params_addr)` (a single typed-pointer struct in GM), not
-// the raw N-pointer pattern PTO `gemm_basic` uses. We keep the device
-// kernel signature unchanged for now (Phase 3 may flatten it), and
-// just bridge tensor → pointer here.
-//
-// Phase 3 will extend the op signature to (act_int4, wgt_int4, ascales,
-// wscales, lora_act_in, lora_up, bias?, wcscales?, smooth_next?) and
-// return a tuple including optional qout / oscales; the binding layer
-// stays at this level and only the host launcher signature grows.
+// Phase 3b/3c will extend to (act, wgt, ascales, wscales, lora_act_in,
+// lora_up, bias?, wcscales?, smooth_next?) and return a tuple with
+// optional qout / oscales; the binding layer pattern stays the same,
+// only the host launcher signature grows.
 
 #include <ATen/ATen.h>
 #include <torch/library.h>
@@ -35,47 +25,67 @@ namespace svdquant_op {
 
 constexpr auto kNpuDevice = c10::DeviceType::PrivateUse1;
 
-// Phase 2d / 2f mock kernel constants — must match
+// Phase 3a tile is hardcoded — must match
 // `csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp` constexpr block.
-// These won't be hardcoded forever; Phase 3 tile-parameterizes the
-// kernel and the binding then forwards M/K/N from the input tensor
-// shapes rather than asserting them.
-constexpr int64_t kPhase2dM        = 64;
-constexpr int64_t kPhase2dK        = 128;
-constexpr int64_t kPhase2dN        = 128;
-constexpr int64_t kPhase2dRing     = 6;
-constexpr int64_t kPhase2dNumTiles = 8;
+// Tile-parameterization comes in Phase 3b/3c.
+constexpr int64_t kPhase3aM         = 128;
+constexpr int64_t kPhase3aK         = 2048;
+constexpr int64_t kPhase3aN         = 256;
+constexpr int64_t kPhase3aBlockSize = 64;        // K-block / mad_s4 KS
+constexpr int64_t kPhase3aRingSlots = 6;
 
-at::Tensor run_gemm_w4a4(const at::Tensor& act, const at::Tensor& wgt)
+at::Tensor run_gemm_w4a4(const at::Tensor& act,
+                         const at::Tensor& wgt,
+                         const at::Tensor& ascales,
+                         const at::Tensor& wscales)
 {
     TORCH_CHECK(act.device().type() == kNpuDevice,
                 "act must be a NPU tensor (PrivateUse1)");
     TORCH_CHECK(wgt.device().type() == kNpuDevice,
                 "wgt must be a NPU tensor (PrivateUse1)");
-    TORCH_CHECK(act.scalar_type() == at::kHalf, "act must be float16");
-    TORCH_CHECK(wgt.scalar_type() == at::kHalf, "wgt must be float16");
-    TORCH_CHECK(act.dim() == 2 && wgt.dim() == 2,
-                "act and wgt must be 2D tensors");
-    TORCH_CHECK(act.size(0) == kPhase2dM && act.size(1) == kPhase2dK,
-                "act shape must be [", kPhase2dM, ", ", kPhase2dK, "] (Phase 2f mock)");
-    TORCH_CHECK(wgt.size(0) == kPhase2dK && wgt.size(1) == kPhase2dN,
-                "wgt shape must be [", kPhase2dK, ", ", kPhase2dN, "] (Phase 2f mock)");
-    TORCH_CHECK(act.is_contiguous(), "act must be contiguous");
-    TORCH_CHECK(wgt.is_contiguous(), "wgt must be contiguous");
+    TORCH_CHECK(ascales.device().type() == kNpuDevice,
+                "ascales must be a NPU tensor (PrivateUse1)");
+    TORCH_CHECK(wscales.device().type() == kNpuDevice,
+                "wscales must be a NPU tensor (PrivateUse1)");
+    TORCH_CHECK(act.scalar_type() == at::kByte, "act must be uint8 (packed INT4)");
+    TORCH_CHECK(wgt.scalar_type() == at::kByte, "wgt must be uint8 (packed INT4)");
+    TORCH_CHECK(ascales.scalar_type() == at::kHalf, "ascales must be float16");
+    TORCH_CHECK(wscales.scalar_type() == at::kHalf, "wscales must be float16");
+    TORCH_CHECK(act.dim() == 2 && wgt.dim() == 2 && ascales.dim() == 2 && wscales.dim() == 2,
+                "all tensors must be 2D");
 
-    // Output is over-allocated to fit the cube ring scratch followed
-    // by the linear vec_out slots. The caller (test) slices the
-    // vec_out portion out by skipping the first kRingSlots × M × N
-    // fp32 elements. Phase 3 separates the scratch into its own
-    // workspace and `out` becomes [M, N] only.
-    const int64_t total_slots = kPhase2dRing + kPhase2dNumTiles;
-    auto out = at::empty({total_slots * kPhase2dM, kPhase2dN},
-                         act.options().dtype(at::kFloat));
+    constexpr int64_t kK_packed = kPhase3aK / 2;
+    constexpr int64_t kK_blocks = kPhase3aK / kPhase3aBlockSize;
+    TORCH_CHECK(act.size(0) == kPhase3aM && act.size(1) == kK_packed,
+                "act shape must be [", kPhase3aM, ", ", kK_packed, "] (Phase 3a)");
+    TORCH_CHECK(wgt.size(0) == kPhase3aN && wgt.size(1) == kK_packed,
+                "wgt shape must be [", kPhase3aN, ", ", kK_packed, "] (Phase 3a)");
+    TORCH_CHECK(ascales.size(0) == kK_blocks && ascales.size(1) == kPhase3aM,
+                "ascales shape must be [", kK_blocks, ", ", kPhase3aM, "] (Phase 3a)");
+    TORCH_CHECK(wscales.size(0) == kK_blocks && wscales.size(1) == kPhase3aN,
+                "wscales shape must be [", kK_blocks, ", ", kPhase3aN, "] (Phase 3a)");
+    TORCH_CHECK(act.is_contiguous() && wgt.is_contiguous(),
+                "act and wgt must be contiguous");
+    TORCH_CHECK(ascales.is_contiguous() && wscales.is_contiguous(),
+                "ascales and wscales must be contiguous");
+
+    auto fp16_options = act.options().dtype(at::kHalf);
+    auto i32_options  = act.options().dtype(at::kInt);
+
+    // Workspace = cube/vec hand-off ring of int32 partials. Caching
+    // allocator keeps re-alloc cost ~free across calls. Lifetime
+    // ends with this `at::Tensor` going out of scope at function exit.
+    auto workspace = at::empty(
+        {kPhase3aRingSlots, kPhase3aM, kPhase3aN}, i32_options);
+    auto out = at::empty({kPhase3aM, kPhase3aN}, fp16_options);
 
     auto stream = c10_npu::getCurrentNPUStream().stream(false);
     svdquant::ascend::gemm_w4a4(
         const_cast<void*>(act.storage().data()),
         const_cast<void*>(wgt.storage().data()),
+        const_cast<void*>(ascales.storage().data()),
+        const_cast<void*>(wscales.storage().data()),
+        workspace.data_ptr(),
         out.data_ptr(),
         static_cast<void*>(stream));
     return out;
@@ -87,10 +97,10 @@ namespace {
 
 TORCH_LIBRARY_FRAGMENT(svdquant, m)
 {
-    // Phase 2f schema — minimal, two NPU half tensors in, one fp32
-    // tensor out. Phase 3 will append optional ascales/wscales/lora_*
-    // and turn the return type into a tuple to surface qout/oscales.
-    m.def("gemm_w4a4(Tensor act, Tensor wgt) -> Tensor");
+    // Phase 3a schema — INT4 main path (no LoRA / bias / wcscales /
+    // next-layer quant yet). Phase 3b/3c append optional Tensors and
+    // turn the return type into a tuple to surface qout / oscales.
+    m.def("gemm_w4a4(Tensor act, Tensor wgt, Tensor ascales, Tensor wscales) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(svdquant, PrivateUse1, m)

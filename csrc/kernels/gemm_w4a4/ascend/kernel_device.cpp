@@ -1,62 +1,81 @@
 // gemm_w4a4 — Ascend __aicore__ device kernel.
 //
-// Phase 2d (current): preload + main loop double-stage cube driver,
-// 6-slot ring buffer with cube ↔ vec back-pressure, num_tiles tiles
-// per launch.
+// Phase 3a: real INT4 cube MMA + per-K-block dequant in vec.
 //
-//   - AIC: kPreloadNum = kRingSlots tiles fired into ring slots 0..N-1
-//     unconditionally (preload — no wait on vec because the slots
-//     start empty). Then main loop: for each remaining tile, wait
-//     VEC_TILE_CONSUMED (= "vec freed up at least one slot"), produce
-//     into slot = tile_idx % kRingSlots, signal CUBE_TILE_READY.
-//   - AIV: single loop — wait CUBE_TILE_READY, consume slot =
-//     tile_idx % kRingSlots, TSTORE to vec_out[tile_idx], signal
-//     VEC_TILE_CONSUMED.
+// Tile shape (hardcoded for 3a; tile-parameterization is 3b/3c):
+//   M = 128, K_logical = 2048, K_packed = 1024, N = 256
+//   K-block = 64 logical = 32 packed bytes  (== mad_s4 KS == INT4_BLOCK_SIZE)
+//   ⇒ 32 K-blocks per tile, 1 tile per launch.
 //
-// Why double-stage on cube and not single-stage with counter-prefill:
-// FA pre-increments BUF1_SV_CONSUMED kRingSlots times via st_dev to
-// represent "ring starts empty"; that needs the FFTS base address as
-// an explicit kernel arg. Our auto-gen wrapper already calls
-// set_ffts_base_addr internally and does NOT pass the ffts_addr GM
-// pointer to the user kernel signature, so st_dev is unavailable. The
-// FA double-stage form is the equivalent idiom that doesn't need
-// ffts_addr — Phase A produces while the ring is known-empty,
-// Phase B does the steady-state wait/produce dance. End result is
-// the same producer/consumer wave shape.
+// Buffers:
+//   L1 (512 KB):
+//     A tile [128, 1024] int8_t = 128 KB at offset 0
+//     B tile [1024, 256] int8_t = 256 KB at offset 128 KB
+//     Total 384 KB (no L1 ping-pong; whole BK loaded once per launch).
+//   L0A / L0B (64 KB each):
+//     ping-pong sub-tiles for one K-block (sizes set in
+//     pto_macro_matmul_s4.hpp). 4 KB / 8 KB tiles → ample headroom.
+//   L0C (256 KB):
+//     single int32 [128, 256] = 128 KB at offset 0. No ping-pong —
+//     each K-block writes init=true and is drained to GM workspace
+//     before the next mad_s4 overwrites L0C.
+//   GM workspace (caller-allocated):
+//     int32 [kRingSlots=6, 128, 256] cube/vec hand-off ring (768 KB).
+//   GM out (caller-allocated): fp16 [128, 256] = 64 KB final.
 //
-// Cross-iter UB sync on the vec side: each iter does TLOAD →
-// TROWEXPANDMUL/TADD → TSTORE on the same UB region (runningOTile).
-// Need MTE3 → MTE2 sync between iters so the next TLOAD doesn't
-// overwrite UB while the prev TSTORE is still reading it. We seed
-// one set_flag(PIPE_MTE3, PIPE_MTE2) at vec entry, wait+set inside
-// the loop, drain on exit.
+// Cube path (per K-block):
+//   wait FIX→M  (prev TSTORE off L0C)         ← skipped on first iter
+//   wait M→MTE1 (prev TEXTRACT on this pingpong drained)
+//   slide L1 view to kb-th K-block via TASSIGN from saved bases
+//   pto_macro_matmul_s4_block: TEXTRACT + mad_s4 (init=true)  → L0C
+//   set M→FIX  ;  wait M→FIX (gate TSTORE on mad_s4 done)
+//   TSTORE L0C → workspace[slot=kb%kRingSlots]
+//   ffts_cross_core_sync(FIX, CUBE_TILE_READY)
+//   set FIX→M   (next mad_s4 may overwrite L0C)
+//   set M→MTE1  (next iter may reuse this pingpong slot)
 //
-// Cube ping-pong (PIPE_M → PIPE_MTE1) is per-tile self-contained:
-// seed at iter top, drain at iter bottom. The flags are private to
-// pto_macro_matmul's K-loop, not shared across tiles.
+// Back-pressure: kPreloadNum = kRingSlots = 6 K-blocks fired without
+// vec gate (slots empty); from kb >= 6 onwards each iter waits one
+// VEC_TILE_CONSUMED before producing. Drain trailing kRingSlots
+// VEC_TILE_CONSUMED signals on exit so the FFTS counter ends clean
+// (vec signals 32 times total; cube only waited 32-6=26 times in the
+// loop).
 //
-// Tile sizes are still mock (64×128×128) — Phase 3 will pick the
-// real BM/BN/BK after we drop in the s4 path. Phase 2e adds a
-// PyTorch reference and the smoke compares element-wise.
+// Vec path (per K-block):
+//   wait_flag_dev(CUBE_TILE_READY)
+//   TLOAD partial_i32 from workspace[slot] (vecM rows, BN cols)
+//   TLOAD ascale fp16 row from ascales[kb, m_off:m_off+vecM]
+//   TLOAD wscale fp16 col from wscales[kb, :]
+//   TCVT i32→f32 (partial), fp16→f32 (ascale, wscale)
+//   TROWEXPANDMUL (apply ascale per row)
+//   TCOLEXPANDMUL (apply wscale per col)
+//   TADD into running_f32 accumulator (or TMOV if kb==0)
+//   ffts_cross_core_sync(MTE2, VEC_TILE_CONSUMED)   ← free ring slot
+// After last K-block:
+//   TCVT running_f32 → running_f16
+//   TSTORE → out_gm[m_off:m_off+vecM, :]
+//
+// The TASSIGN-on-data() bug in pto_macro_matmul.hpp doesn't affect us
+// because we save the L1 base ptr before the K-loop and recompute the
+// per-K-block view from base every iter. (Phase 2d hit Cube_K=Tile_K
+// so its loop iterated only once and the bug was masked.)
 //
 // `__enable_feature_for_compile_default = KERNEL_TYPE_MIX_AIC_1_2`
-// keeps the auto-gen wrapper in mix mode (1 cube : 2 vec) — see
-// Phase 2a comment block in git log for the rationale.
+// keeps the auto-gen wrapper in mix mode (1 cube : 2 vec).
 
 #include "kernel_operator.h"
 #include <pto/pto-inst.hpp>
 
-#include "pto_macro_matmul.hpp"
-#include "phase3_sanity.hpp"
+#include "pto_macro_matmul_s4.hpp"
 
 constexpr KernelMetaType __enable_feature_for_compile_default = KERNEL_TYPE_MIX_AIC_1_2;
 
 namespace {
 
-// FFTS flag IDs — same enum as Phase 2a so subsequent phases don't
-// have to renumber. CUBE_TILE_READY / VEC_TILE_CONSUMED are the
-// producer/consumer signals for the ring; HANDSHAKE_* slots are
-// leftovers from Phase 2a, kept for future rerouting.
+// FFTS flag IDs — same enum as Phase 2a–2d so subsequent phases don't
+// have to renumber. CUBE_TILE_READY / VEC_TILE_CONSUMED are now the
+// per-K-block producer/consumer signals (each fires 32 times per
+// launch, not 8 like Phase 2d).
 enum GemmFftsFlag : uint16_t {
     HANDSHAKE_CUBE_TO_VEC = 0,
     HANDSHAKE_VEC_TO_CUBE = 1,
@@ -64,48 +83,36 @@ enum GemmFftsFlag : uint16_t {
     VEC_TILE_CONSUMED    = 3,
 };
 
-// Device-side params layout. ccec disallows casting `void* __gm__` to
-// a typed `__gm__ T*` inside aicore code, so we can't read the public
-// `svdquant::GemmW4A4Params` directly here. The host launcher packs
-// typed pointers into this byte-compatible struct (24 B = 3 × 8 B
-// pointers) and H2D-copies it to dev_params. Keep host (kernel.cpp)
-// and device sides in sync.
+// Mirrors host-side DeviceParams in kernel.cpp. ccec disallows casting
+// `void* __gm__` to a typed `__gm__ T*` inside aicore code, so we read
+// these typed pointers from a host-packed struct on entry. Field
+// order MUST match the host-side struct exactly.
 struct DeviceParams {
-    __gm__ half*  act;   // [Tile_M, Tile_K] half row-major
-    __gm__ half*  wgt;   // [Tile_N, Tile_K] half row-major (NT-viewed)
-    __gm__ float* out;   // [(kRingSlots + kNumTiles), Tile_M, Tile_N] fp32:
-                         //   [0 .. kRingSlots)        cube ring
-                         //   [kRingSlots .. +kNumTiles)
-                         //                            vec_out (linear,
-                         //                            one slot per tile,
-                         //                            0..kNumTiles-1).
+    __gm__ uint8_t* act;        // [128, 1024]  packed INT4
+    __gm__ uint8_t* wgt;        // [256, 1024]  packed INT4
+    __gm__ half*    ascales;    // [32, 128]    fp16 (K-block, M)
+    __gm__ half*    wscales;    // [32, 256]    fp16 (K-block, N)
+    __gm__ int32_t* workspace;  // [kRingSlots, 128, 256] int32 cube/vec ring
+    __gm__ half*    out;        // [128, 256]   fp16 final
 };
 
-// Phase 2c-onwards mock dequant scale; baked into the kernel via
-// TEXPANDS. Phase 3 derives the real per-row scale in-tile from
-// ascales × wscales and TEXPANDS retires.
-constexpr float kVecScale = 0.5f;
+// Tile shape constants — pinned for 3a single-tile.
+constexpr uint32_t kBM         = 128;
+constexpr uint32_t kBN         = 256;
+constexpr uint32_t kBKLogical  = 2048;
+constexpr uint32_t kBKPacked   = kBKLogical / 2;
+constexpr uint32_t kKSLogical  = 64;                   // mad_s4 K-block / scale block
+constexpr uint32_t kKSPacked   = kKSLogical / 2;       // 32 packed bytes
+constexpr uint32_t kNumKBlocks = kBKLogical / kKSLogical;  // 32
 
-// Mock-stage cube tile shape. Phase 2d still uses 64×128×128 — the
-// goal here is the ring + back-pressure plumbing, not throughput.
-// Phase 3 picks the final BM/BN/BK once s4 lands.
-constexpr uint32_t kTileM = 64;
-constexpr uint32_t kTileK = 128;
-constexpr uint32_t kTileN = 128;
-
-// Ring buffer slot count and the number of tiles produced per launch.
-// kPreloadNum = kRingSlots → cube can fill the entire ring once
-// without back-pressure (the simplest two-stage form). With
-// kNumTiles = 8 and kRingSlots = 6, the main-loop stage runs for
-// kNumTiles - kRingSlots = 2 iterations, each gated by a
-// VEC_TILE_CONSUMED signal — enough to actually exercise slot reuse
-// (slots 0 and 1 get re-written by tiles 6 and 7).
+// Cube-vec ring. kPreloadNum = kRingSlots so cube fills the ring once
+// without back-pressure, then steady-state waits VEC_TILE_CONSUMED.
 constexpr uint32_t kRingSlots  = 6;
-constexpr uint32_t kNumTiles   = 8;
 constexpr uint32_t kPreloadNum = kRingSlots;
 
 // Mix mode 1:2 — 1 cube + 2 vec subblocks per cluster.
 constexpr uint16_t kAivPerAic = 2;
+constexpr uint32_t kVecM      = kBM / kAivPerAic;      // 64 rows per AIV subblock
 
 }  // namespace
 
@@ -116,201 +123,285 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
     if ASCEND_IS_AIC {
         auto* act_gm = p->act;
         auto* wgt_gm = p->wgt;
-        auto* out_gm = p->out;
+        auto* ws_gm  = p->workspace;
 
-        // Phase 3a-min compile-only probe — see phase3_sanity.hpp. The
-        // volatile gate prevents DCE so ccec actually instantiates the
-        // uint8/int8 Tile templates and emits the raw mad_s4 op; the
-        // call itself never executes (gate is read-only false). Goal is
-        // to fail-fast at cross-build if the vendored a2a3 PTO snapshot
-        // rejects the s4 type plumbing.
-        volatile bool phase3_compile_gate = false;
-        if (phase3_compile_gate) {
-            svdquant_phase3::phase3_int4_compile_probe(
-                (__gm__ int8_t*)act_gm,
-                (__gm__ int8_t*)wgt_gm,
-                (__gm__ int32_t*)out_gm);
-        }
-
-        // Tile + GM types are independent of tile_idx; declare once.
-        // L1: A row-major bulk + row-major sub-fractal; B row-major
-        // bulk + col-major sub-fractal — pto_macro_matmul deduces NT
-        // (C = A · B^T) from this combination.
-        using TileMatA = pto::Tile<pto::TileType::Mat, half, kTileM, kTileK,
-                                    pto::BLayout::ColMajor, kTileM, kTileK,
+        using TileMatA = pto::Tile<pto::TileType::Mat, int8_t, kBM, kBKPacked,
+                                    pto::BLayout::ColMajor, kBM, kBKPacked,
                                     pto::SLayout::RowMajor, 512>;
-        using TileMatB = pto::Tile<pto::TileType::Mat, half, kTileK, kTileN,
-                                    pto::BLayout::RowMajor, kTileK, kTileN,
+        using TileMatB = pto::Tile<pto::TileType::Mat, int8_t, kBKPacked, kBN,
+                                    pto::BLayout::RowMajor, kBKPacked, kBN,
                                     pto::SLayout::ColMajor, 512>;
-        using TileAccC = pto::TileAcc<float, kTileM, kTileN, kTileM, kTileN>;
-        using GlobalA  = pto::GlobalTensor<half,
-            pto::Shape<1, 1, 1, kTileM, kTileK>,
-            pto::Stride<1, 1, 1, kTileK, 1>>;
-        using GlobalB  = pto::GlobalTensor<half,
-            pto::Shape<1, 1, 1, kTileK, kTileN>,
-            pto::Stride<1, 1, 1, 1, kTileK>,
+        using TileAccC = pto::TileAcc<int32_t, kBM, kBN, kBM, kBN>;
+
+        using GlobalA  = pto::GlobalTensor<int8_t,
+            pto::Shape<1, 1, 1, kBM, kBKPacked>,
+            pto::Stride<1, 1, 1, kBKPacked, 1>>;
+        using GlobalB  = pto::GlobalTensor<int8_t,
+            pto::Shape<1, 1, 1, kBKPacked, kBN>,
+            pto::Stride<1, 1, 1, 1, kBKPacked>,
             pto::Layout::DN>;
-        using GlobalOut = pto::GlobalTensor<float,
-            pto::Shape<1, 1, 1, kTileM, kTileN>,
-            pto::Stride<1, 1, 1, kTileN, 1>>;
+        using GlobalRingSlot = pto::GlobalTensor<int32_t,
+            pto::Shape<1, 1, 1, kBM, kBN>,
+            pto::Stride<1, 1, 1, kBN, 1>>;
 
-        constexpr uint32_t kAByteOffset = 0;
-        constexpr uint32_t kBByteOffset = kTileM * kTileK * 2;  // sizeof(half)
+        // L1 layout: A at offset 0 (128 KB), B at offset 128 KB (256 KB).
+        // Total 384 KB / 512 KB.
+        constexpr uint64_t kL1AByteOffset = 0;
+        constexpr uint64_t kL1BByteOffset = (uint64_t)kBM * kBKPacked;
 
-        // Single fused preload + main loop. Conceptually two stages:
-        //   Phase A (i < kPreloadNum) — produce without back-pressure;
-        //                               ring slots are known empty.
-        //   Phase B (i >= kPreloadNum) — wait for vec to free a slot
-        //                                via VEC_TILE_CONSUMED, then
-        //                                produce.
-        // Fused into one loop because ccec doesn't tag lambda bodies
-        // [aicore] (PTO intrinsics rejected with "call to [aicore]
-        // function from [host] function") so a lambda extraction breaks
-        // the build. The `if (i >= kPreloadNum)` guard makes the
-        // double-stage shape explicit at the source level.
-        constexpr uint32_t kActualPreload =
-            (kPreloadNum < kNumTiles) ? kPreloadNum : kNumTiles;
+        TileMatA aMatTile;
+        TileMatB bMatTile;
+        TileAccC cAccTile;
+        TASSIGN(aMatTile, kL1AByteOffset);
+        TASSIGN(bMatTile, kL1BByteOffset);
+        TASSIGN(cAccTile, 0u);  // L0C single buffer
 
-        for (uint32_t i = 0; i < kNumTiles; ++i) {
-            if (i >= kActualPreload) {
-                // Phase B back-pressure gate — only kicks in after the
-                // ring's been filled once.
+        GlobalA aGlobal((__gm__ int8_t*)act_gm);
+        GlobalB bGlobal((__gm__ int8_t*)wgt_gm);
+
+        // One-shot TLOAD of the full BK into L1.
+        TLOAD(aMatTile, aGlobal);
+        TLOAD(bMatTile, bGlobal);
+
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+
+        // Save L1 base addresses for K-block sliding. The macro's
+        // `aMatTile.data()` will return the most-recently-TASSIGN'd
+        // value, which compounds if we rely on it; recompute each
+        // iter from a fixed base.
+        const uint64_t kL1A_base = (uint64_t)aMatTile.data();
+        const uint64_t kL1B_base = (uint64_t)bMatTile.data();
+
+        // Seed cross-pipe flags.
+        // - PIPE_M → PIPE_MTE1 (×2 events for L0 ping-pong): so the
+        //   first wait_flag inside the loop is satisfied on iter 0.
+        // - PIPE_FIX → PIPE_M: so the first mad_s4 may overwrite L0C
+        //   without waiting on a non-existent prior TSTORE.
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+        set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+
+        for (uint32_t kb = 0; kb < kNumKBlocks; ++kb) {
+            const uint64_t pingpong = kb & 1;
+            const uint32_t slot     = kb % kRingSlots;
+
+            // Back-pressure: after the ring's filled once, vec must
+            // free a slot for each subsequent producer iter.
+            if (kb >= kPreloadNum) {
                 wait_flag_dev(VEC_TILE_CONSUMED);
             }
-            const uint32_t slot = i % kRingSlots;
 
-            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+            // Slide L1 view to the kb-th K-block. Strides:
+            //   A: kKSPacked * kBM bytes per K-block (M-fast ColMajor BLayout)
+            //   B: kKSPacked * kBN bytes per K-block (K-fast RowMajor BLayout)
+            TASSIGN(aMatTile, kL1A_base + (uint64_t)kb * kKSPacked * kBM);
+            TASSIGN(bMatTile, kL1B_base + (uint64_t)kb * kKSPacked * kBN);
 
-            TileMatA aMatTile;
-            TileMatB bMatTile;
-            TileAccC cAccTile;
-            TASSIGN(aMatTile, kAByteOffset);
-            TASSIGN(bMatTile, kBByteOffset);
-            TASSIGN(cAccTile, 0u);
+            // Wait L0C is free (prev TSTORE drained on FIX pipe).
+            wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+            // Wait this ping-pong's L0A/B slot is free (prev mad_s4 drained).
+            wait_flag(PIPE_M, PIPE_MTE1, (event_t)pingpong);
 
-            GlobalA aGlobal(act_gm);
-            GlobalB bGlobal(wgt_gm);
-            GlobalOut cGlobal(out_gm + slot * kTileM * kTileN);
+            pto::pto_macro_matmul_s4_block<kBM, kBN, kKSLogical>(
+                aMatTile, bMatTile, cAccTile, pingpong);
 
-            TLOAD(aMatTile, aGlobal);
-            TLOAD(bMatTile, bGlobal);
-
-            set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-
-            pto::pto_macro_matmul<kTileM, kTileK, kTileN>(aMatTile, bMatTile, cAccTile);
-
+            // Gate the FIX-pipe TSTORE on mad_s4 done.
             set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
             wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
 
-            TSTORE(cGlobal, cAccTile);
+            // Drain int32 partial to the ring slot.
+            GlobalRingSlot ringSlot(ws_gm + (uint64_t)slot * kBM * kBN);
+            TSTORE(ringSlot, cAccTile);
 
-            // mode 0x2 = subblock-broadcast; one cube signal unblocks
-            // both vec subblocks in this cluster.
+            // Tell vec this K-block is consumable.
             ffts_cross_core_sync(PIPE_FIX, pto::getFFTSMsg(0x2, CUBE_TILE_READY));
 
-            // Drain ping-pong flags so next iter can re-seed cleanly.
-            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+            // L0C is again writable for the next mad_s4.
+            set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+            // This pingpong slot can be re-extracted into.
+            set_flag(PIPE_M, PIPE_MTE1, (event_t)pingpong);
         }
 
-        // Drain the trailing VEC_TILE_CONSUMED signals so the FFTS
-        // counter exits clean. Vec signals kNumTiles times total; the
-        // loop above only waited (kNumTiles - kActualPreload) times,
-        // leaving kActualPreload extra signals to absorb.
-        for (uint32_t i = 0; i < kActualPreload; ++i) {
+        // Drain trailing per-pingpong ping-pong gates.
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+        // Drain trailing FIX→M gate.
+        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+
+        // Drain trailing VEC_TILE_CONSUMED signals — vec fires once
+        // per K-block (32 times); cube only waited (32 - kPreloadNum)
+        // times in the loop, so kPreloadNum signals are still queued.
+        for (uint32_t i = 0; i < kPreloadNum; ++i) {
             wait_flag_dev(VEC_TILE_CONSUMED);
         }
     }
 
     if ASCEND_IS_AIV {
-        constexpr uint32_t kVecM = kTileM / kAivPerAic;
-        const uint32_t subblockid = get_subblockid();
-
+        auto* ws_gm  = p->workspace;
+        auto* as_gm  = p->ascales;
+        auto* wsl_gm = p->wscales;
         auto* out_gm = p->out;
 
-        // out_gm layout (elements):
-        //   [0 .. kRingSlots * M * N)         cube ring
-        //   [kRingSlots * M * N .. above + kNumTiles * M * N)
-        //                                     vec_out (linear by tile_idx)
-        constexpr uint32_t kVecOutBaseElems = kRingSlots * kTileM * kTileN;
-        const uint32_t row_off_elems = kVecM * kTileN * subblockid;
+        const uint32_t subblockid = get_subblockid();
+        const uint32_t row_off    = kVecM * subblockid;  // 0 or 64
 
-        using TileVecF = pto::Tile<pto::TileType::Vec, float, kVecM, kTileN,
-                                    pto::BLayout::RowMajor, kVecM, kTileN>;
-        using TileReduceF = pto::Tile<pto::TileType::Vec, float, kVecM, 1,
-                                       pto::BLayout::ColMajor, kVecM, 1>;
-        using GlobalSrc = pto::GlobalTensor<float,
-            pto::Shape<1, 1, 1, kVecM, kTileN>,
-            pto::Stride<1, 1, 1, kTileN, 1>>;
-
-        // UB layout (private per subblock):
-        //   [0 .. 16 KB)              runningOTile [Vec_M, Tile_N] fp32
-        //   [16 KB .. 32 KB)          estTile      [Vec_M, Tile_N] fp32
-        //   [32 KB .. 32 KB + 128 B)  scaleTile    [Vec_M, 1]      fp32
+        // UB layout (per AIV subblock; UB ≈ 248 KB on dav_c220 mix):
+        //   running_f32      [vecM=64, BN=256] f32   = 64 KB  @ 0
+        //   partial_i32      [vecM=64, BN=256] i32   = 64 KB  @ 64 KB
+        //   partial_f32      [vecM=64, BN=256] f32   = 64 KB  @ 128 KB
+        //   ascale_f16       [vecM=64]         f16   = 128 B  @ 192 KB
+        //   ascale_f32       [vecM=64]         f32   = 256 B  @ 192 KB + 256
+        //   wscale_f16       [BN=256]          f16   = 512 B  @ 192 KB + 1 KB
+        //   wscale_f32       [BN=256]          f32   = 1 KB   @ 192 KB + 2 KB
+        //   out_f16          [vecM=64, BN=256] f16   = 32 KB  @ 192 KB + 4 KB
+        // Total ≈ 192 KB + 36 KB = 228 KB / 248 KB.
         constexpr uint32_t kRunningOff = 0;
-        constexpr uint32_t kEstOff     = kVecM * kTileN * 4;
-        constexpr uint32_t kScaleOff   = kEstOff + kVecM * kTileN * 4;
+        constexpr uint32_t kPartialI32Off = kVecM * kBN * 4;
+        constexpr uint32_t kPartialF32Off = kPartialI32Off + kVecM * kBN * 4;
+        constexpr uint32_t kAscaleF16Off  = kPartialF32Off + kVecM * kBN * 4;
+        constexpr uint32_t kAscaleF32Off  = kAscaleF16Off + kVecM * 2;
+        constexpr uint32_t kWscaleF16Off  = kAscaleF32Off + kVecM * 4;
+        constexpr uint32_t kWscaleF32Off  = kWscaleF16Off + kBN * 2;
+        constexpr uint32_t kOutF16Off     = kWscaleF32Off + kBN * 4;
 
-        // Seed MTE3 → MTE2 sync — the first iter has no prev TSTORE to
-        // wait on, but the wait_flag inside the loop must see at least
-        // one matched set_flag.
+        using TilePartialI32 = pto::Tile<pto::TileType::Vec, int32_t, kVecM, kBN,
+                                          pto::BLayout::RowMajor, kVecM, kBN>;
+        using TilePartialF32 = pto::Tile<pto::TileType::Vec, float, kVecM, kBN,
+                                          pto::BLayout::RowMajor, kVecM, kBN>;
+        using TileRunningF32 = pto::Tile<pto::TileType::Vec, float, kVecM, kBN,
+                                          pto::BLayout::RowMajor, kVecM, kBN>;
+        using TileOutF16     = pto::Tile<pto::TileType::Vec, half, kVecM, kBN,
+                                          pto::BLayout::RowMajor, kVecM, kBN>;
+
+        // ascale = per-row M scale → ColMajor [vecM, 1] (Phase 2c
+        // convention; matches TROWEXPANDMUL src1 contract).
+        using TileAscaleF16 = pto::Tile<pto::TileType::Vec, half, kVecM, 1,
+                                         pto::BLayout::ColMajor, kVecM, 1>;
+        using TileAscaleF32 = pto::Tile<pto::TileType::Vec, float, kVecM, 1,
+                                         pto::BLayout::ColMajor, kVecM, 1>;
+        // wscale = per-col N scale → RowMajor [1, BN] (TCOLEXPANDMUL src1).
+        using TileWscaleF16 = pto::Tile<pto::TileType::Vec, half, 1, kBN,
+                                         pto::BLayout::RowMajor, 1, kBN>;
+        using TileWscaleF32 = pto::Tile<pto::TileType::Vec, float, 1, kBN,
+                                         pto::BLayout::RowMajor, 1, kBN>;
+
+        using GlobalRingSlot = pto::GlobalTensor<int32_t,
+            pto::Shape<1, 1, 1, kVecM, kBN>,
+            pto::Stride<1, 1, 1, kBN, 1>>;
+        // TLOAD into a ColMajor [vecM, 1] reduce tile must come from a
+        // DN-layout Global (PTO trowexpandmul ST testcase pattern).
+        using GlobalAscaleRow = pto::GlobalTensor<half,
+            pto::Shape<1, 1, 1, kVecM, 1>,
+            pto::Stride<1, 1, 1, 1, 1>,
+            pto::Layout::DN>;
+        using GlobalWscaleRow = pto::GlobalTensor<half,
+            pto::Shape<1, 1, 1, 1, kBN>,
+            pto::Stride<1, 1, 1, kBN, 1>>;
+        using GlobalOutTile  = pto::GlobalTensor<half,
+            pto::Shape<1, 1, 1, kVecM, kBN>,
+            pto::Stride<1, 1, 1, kBN, 1>>;
+
+        // Cross-iter UB sync — running_f32 reused across K-blocks.
+        // Seed MTE3→MTE2 so first iter's TLOAD doesn't race a non-
+        // existent prior TSTORE (drained at the end).
         set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
 
-        for (uint32_t tile_idx = 0; tile_idx < kNumTiles; ++tile_idx) {
+        for (uint32_t kb = 0; kb < kNumKBlocks; ++kb) {
             wait_flag_dev(CUBE_TILE_READY);
+            const uint32_t slot = kb % kRingSlots;
 
-            const uint32_t slot       = tile_idx % kRingSlots;
-            const uint32_t cube_off   = slot * kTileM * kTileN + row_off_elems;
-            const uint32_t vec_off    = kVecOutBaseElems + tile_idx * kTileM * kTileN
-                                        + row_off_elems;
+            // GM offsets:
+            //   ring slot row band (this AIV subblock owns rows
+            //     [row_off, row_off + kVecM)) into workspace[slot]
+            //   ascales[kb, row_off:row_off+kVecM]
+            //   wscales[kb, :]
+            //   out[row_off:row_off+kVecM, :]
+            const uint64_t partial_off =
+                (uint64_t)slot * kBM * kBN + (uint64_t)row_off * kBN;
+            const uint64_t ascale_off  = (uint64_t)kb * kBM + row_off;
+            const uint64_t wscale_off  = (uint64_t)kb * kBN;
+            const uint64_t out_off     = (uint64_t)row_off * kBN;
 
-            TileVecF runningOTile;
-            TileVecF estTile;
-            TileReduceF scaleTile;
-            TASSIGN(runningOTile, kRunningOff);
-            TASSIGN(estTile,      kEstOff);
-            TASSIGN(scaleTile,    kScaleOff);
+            TilePartialI32 partI32;
+            TilePartialF32 partF32;
+            TileRunningF32 running;
+            TileAscaleF16  ascaleF16;
+            TileAscaleF32  ascaleF32;
+            TileWscaleF16  wscaleF16;
+            TileWscaleF32  wscaleF32;
+            TileOutF16     outF16;
+            TASSIGN(partI32,   kPartialI32Off);
+            TASSIGN(partF32,   kPartialF32Off);
+            TASSIGN(running,   kRunningOff);
+            TASSIGN(ascaleF16, kAscaleF16Off);
+            TASSIGN(ascaleF32, kAscaleF32Off);
+            TASSIGN(wscaleF16, kWscaleF16Off);
+            TASSIGN(wscaleF32, kWscaleF32Off);
+            TASSIGN(outF16,    kOutF16Off);
 
-            GlobalSrc cubeSrc(out_gm + cube_off);
-            GlobalSrc vecOutGlobal(out_gm + vec_off);
+            GlobalRingSlot  partGm  (p->workspace + partial_off);
+            GlobalAscaleRow ascaleGm(p->ascales   + ascale_off);
+            GlobalWscaleRow wscaleGm(p->wscales   + wscale_off);
 
-            // Wait for prev iter's TSTORE to release the UB region
-            // before the next TLOAD overwrites it.
+            // Wait running_f32 region is free (prev TSTORE on out
+            // tile finished, except on the first iter where this
+            // is the seed).
             wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
 
-            TLOAD(runningOTile, cubeSrc);
-            TLOAD(estTile,      cubeSrc);  // mock: same ring slot reloaded as residual
-
-            // Constant scale on V pipe — see Phase 2c notes for why
-            // TEXPANDS replaces a GM scale buffer.
-            pto::TEXPANDS(scaleTile, kVecScale);
+            TLOAD(partI32,   partGm);
+            TLOAD(ascaleF16, ascaleGm);
+            TLOAD(wscaleF16, wscaleGm);
 
             set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-            pto::TROWEXPANDMUL(runningOTile, runningOTile, scaleTile);
-            pto::TADD(runningOTile, runningOTile, estTile);
+            // Cast i32 → f32, fp16 → f32.
+            pto::TCVT(partF32,   partI32,   pto::RoundMode::CAST_RINT);
+            pto::TCVT(ascaleF32, ascaleF16, pto::RoundMode::CAST_RINT);
+            pto::TCVT(wscaleF32, wscaleF16, pto::RoundMode::CAST_RINT);
 
-            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            // partF32[m,n] *= ascaleF32[m]
+            pto::TROWEXPANDMUL(partF32, partF32, ascaleF32);
+            // partF32[m,n] *= wscaleF32[n]
+            pto::TCOLEXPANDMUL(partF32, partF32, wscaleF32);
 
-            TSTORE(vecOutGlobal, runningOTile);
+            // Accumulate into running_f32. On kb==0 there's no
+            // prior value, so initialize via TMOV; subsequent iters
+            // TADD.
+            if (kb == 0) {
+                pto::TMOV(running, partF32);
+            } else {
+                pto::TADD(running, running, partF32);
+            }
 
-            // Free up the ring slot. Cube's main-loop wait_flag_dev
-            // matches this. PIPE_MTE2 = "after the most recent MTE2
-            // ops" — we don't strictly need the sync semantic here
-            // since TSTORE is on MTE3 not MTE2, but FA's compute_gu
-            // uses PIPE_MTE2 here too and it's consistent across the
-            // codebase.
-            ffts_cross_core_sync(PIPE_MTE2, pto::getFFTSMsg(0x2, VEC_TILE_CONSUMED));
+            // Free the ring slot for the next cube K-block.
+            ffts_cross_core_sync(PIPE_MTE2,
+                                  pto::getFFTSMsg(0x2, VEC_TILE_CONSUMED));
 
-            // Set up MTE3 → MTE2 for next iter's TLOAD.
+            // Re-seed MTE3→MTE2 for the next iter's TLOAD region
+            // dependency. (running and out_f16 occupy disjoint UB
+            // regions, so this is mostly a tail flag bookkeeping
+            // action — but consistent with Phase 2d's pattern.)
             set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         }
 
-        // Drain the trailing seed.
+        // Drain trailing seed before final cast+store.
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+
+        // Final epilogue: f32 → fp16 then TSTORE the AIV's row band.
+        TileRunningF32 runningFinal;
+        TileOutF16     outF16Final;
+        TASSIGN(runningFinal, kRunningOff);
+        TASSIGN(outF16Final,  kOutF16Off);
+
+        pto::TCVT(outF16Final, runningFinal, pto::RoundMode::CAST_RINT);
+
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+
+        const uint64_t out_off = (uint64_t)row_off * kBN;
+        GlobalOutTile outGm(out_gm + out_off);
+        TSTORE(outGm, outF16Final);
     }
 }

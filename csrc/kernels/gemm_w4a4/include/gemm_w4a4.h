@@ -34,30 +34,35 @@
 //
 // Reference: `tmp/nunchaku/src/kernels/zgemm/gemm_w4a4.cu:34-105`.
 //
-// Phase 2f signature: raw device pointers + `void* stream`, no struct
-// wrapper. The torch op extension (`csrc/python/host/svdquant_w4a4_op.cpp`)
-// calls this directly with `at::Tensor.storage().data()` pointers and
-// the current NPU stream from `c10_npu::getCurrentNPUStream`. Phase 2d
-// device kernel still uses constexpr tile sizes (64×128×128, ring=6,
-// num_tiles=8); the dims are not yet parameters here because the
-// device kernel doesn't accept them yet — Phase 3 will add ascales /
-// wscales / lora_* and parameterize.
+// Phase 3a signature: raw device pointers + opaque stream. The torch
+// op extension (`csrc/python/host/svdquant_w4a4_op.cpp`) calls this
+// directly with `at::Tensor.storage().data()` pointers and the current
+// NPU stream from `c10_npu::getCurrentNPUStream`. Tile size is still
+// constexpr-baked into the device kernel (M=128, K=2048, N=256, one
+// tile per launch); Phase 3b/3c add tile parameterization + LoRA /
+// bias / wcscales / next-layer quant args.
 
 namespace svdquant::ascend {
 
-// Phase 2f — fp16 mock interface (matches Phase 2d kernel_device.cpp).
-//   act:    [kTileM, kTileK]                        fp16  device pointer
-//   wgt:    [kTileK, kTileN]                        fp16  device pointer
-//   out:    [(kRingSlots + kNumTiles), kTileM, kTileN] fp32 device pointer
-//             - first kRingSlots × M × N            cube ring scratch
-//             - next  kNumTiles  × M × N            vec_out (final result)
-//   stream: aclrtStream cast to void* (kept opaque so this header
-//           doesn't drag in CANN headers; the .cpp casts back).
+// Phase 3a — INT4 cube + per-K-block dequant interface. Single-tile
+// (M=128, K=2048, N=256) hardcoded; multi-tile is 3b/3c work.
 //
-// Caller (the torch op wrapper) is responsible for allocating `out`
-// large enough for both the cube ring and the linear vec_out region.
-// Synchronization is the caller's responsibility — the launcher
-// returns immediately after `aclrtlaunch_*` issues the kernel.
-void gemm_w4a4(void* act, void* wgt, void* out, void* stream);
+//   act:        [128, 1024]            uint8   2 signed INT4 / byte
+//   wgt:        [256, 1024]            uint8
+//   ascales:    [32, 128]              fp16    per-64-K-block act scale
+//   wscales:    [32, 256]              fp16    per-64-K-block wgt  scale
+//   workspace:  [kRingSlots, 128, 256] int32   cube/vec hand-off ring
+//   out:        [128, 256]             fp16    final dequantized output
+//   stream:     aclrtStream cast to void*.
+//
+// Caller (the torch op wrapper) allocates both `workspace` and `out`.
+// `workspace` lives in caching-allocated NPU memory and only persists
+// for the duration of the call — its contents are not user-visible.
+// Synchronization is the caller's responsibility; this launcher does
+// the H2D pack of the params struct + `aclrtlaunch_*` and returns.
+void gemm_w4a4(void* act, void* wgt,
+               void* ascales, void* wscales,
+               void* workspace, void* out,
+               void* stream);
 
 }  // namespace svdquant::ascend
