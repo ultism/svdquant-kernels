@@ -11,20 +11,29 @@
 // (kRingSlots × M × N) + linear vec_out (kNumTiles × M × N), matching
 // the exact layout the test harness expects.
 //
-// Phase 3 will swap this two-arg signature for the full SVDQuant op:
+// Implementation routes through our existing host launcher
+// `svdquant::ascend::gemm_w4a4(act, wgt, out, stream)`, which internally
+// packs a `DeviceParams` struct + H2D copies it onto the device — that
+// extra step is required because Phase 2d's device kernel signature is
+// `(GM_ADDR params_addr)` (a single typed-pointer struct in GM), not
+// the raw N-pointer pattern PTO `gemm_basic` uses. We keep the device
+// kernel signature unchanged for now (Phase 3 may flatten it), and
+// just bridge tensor → pointer here.
 //
-//   svdquant.gemm_w4a4(act_int4, wgt_int4, ascales, wscales,
-//                      lora_act_in, lora_up, bias?, wcscales?,
-//                      smooth_next?) -> (out, qout?, oscales?)
-//
-// At that point the host launcher in csrc/kernels/gemm_w4a4/ascend/
-// also extends, but this file stays the only Python entry point.
+// Phase 3 will extend the op signature to (act_int4, wgt_int4, ascales,
+// wscales, lora_act_in, lora_up, bias?, wcscales?, smooth_next?) and
+// return a tuple including optional qout / oscales; the binding layer
+// stays at this level and only the host launcher signature grows.
 
-#include "utils.h"
+#include <ATen/ATen.h>
+#include <torch/library.h>
+#include "torch_npu/csrc/core/npu/NPUStream.h"
 
-#include "aclrtlaunch_svdquant_gemm_w4a4_kernel.h"
+#include "gemm_w4a4.h"
 
 namespace svdquant_op {
+
+constexpr auto kNpuDevice = c10::DeviceType::PrivateUse1;
 
 // Phase 2d / 2f mock kernel constants — must match
 // `csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp` constexpr block.
@@ -58,13 +67,17 @@ at::Tensor run_gemm_w4a4(const at::Tensor& act, const at::Tensor& wgt)
     // by the linear vec_out slots. The caller (test) slices the
     // vec_out portion out by skipping the first kRingSlots × M × N
     // fp32 elements. Phase 3 separates the scratch into its own
-    // workspace and `out` becomes [M_total, N] only.
+    // workspace and `out` becomes [M, N] only.
     const int64_t total_slots = kPhase2dRing + kPhase2dNumTiles;
     auto out = at::empty({total_slots * kPhase2dM, kPhase2dN},
                          act.options().dtype(at::kFloat));
 
-    constexpr uint32_t blockDim = 1;
-    INVOKE_PTO_KERNEL(svdquant_gemm_w4a4_kernel, blockDim, act, wgt, out);
+    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    svdquant::ascend::gemm_w4a4(
+        const_cast<void*>(act.storage().data()),
+        const_cast<void*>(wgt.storage().data()),
+        out.data_ptr(),
+        static_cast<void*>(stream));
     return out;
 }
 
