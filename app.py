@@ -25,14 +25,58 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import gradio as gr
+import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 SPACE = ROOT / "space"
 LINK_SCRIPT = SPACE / "link_smoke.sh"
 SMOKE_BIN = SPACE / "svdquant_gemm_w4a4_smoke"
+
+# Phase 2e tile dims — must match kernel_device.cpp / smoke_main.cpp
+PHASE2E_M = 64
+PHASE2E_K = 128
+PHASE2E_N = 128
+PHASE2E_VEC_SCALE = 0.5
+
+# Persistent scratch dir for the act/wgt/ref .bin files. /tmp is fine
+# on the Space container; we keep them around between rerun() calls so
+# the deterministic seed gives byte-identical inputs across retries.
+DATA_DIR = Path(tempfile.gettempdir()) / "svdquant_phase2e"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+ACT_BIN = DATA_DIR / "act.bin"
+WGT_BIN = DATA_DIR / "wgt.bin"
+REF_BIN = DATA_DIR / "ref.bin"
+
+
+def prepare_phase2e_inputs() -> str:
+    """Generate act/wgt fp16 + ref fp32, dump as raw little-endian .bin.
+
+    Imports `baseline.kernels.gemm_w4a4.ref_mock` lazily so a missing
+    baseline package surfaces with a clear traceback in the smoke log
+    (rather than at module load and obscuring everything else).
+    """
+    sys.path.insert(0, str(ROOT))
+    from baseline.kernels.gemm_w4a4.ref_mock import make_inputs, mock_gemm
+
+    act, wgt = make_inputs(PHASE2E_M, PHASE2E_K, PHASE2E_N)
+    ref = mock_gemm(act, wgt, scale=PHASE2E_VEC_SCALE).astype(np.float32)
+
+    ACT_BIN.write_bytes(act.tobytes())
+    WGT_BIN.write_bytes(wgt.tobytes())
+    REF_BIN.write_bytes(ref.tobytes())
+
+    return (
+        f"[phase2e] inputs ready in {DATA_DIR}: "
+        f"act fp16 [{PHASE2E_M},{PHASE2E_K}] {ACT_BIN.stat().st_size}B, "
+        f"wgt fp16 [{PHASE2E_N},{PHASE2E_K}] {WGT_BIN.stat().st_size}B, "
+        f"ref fp32 [{PHASE2E_M},{PHASE2E_N}] {REF_BIN.stat().st_size}B "
+        f"(ref stats: min={ref.min():.3f} max={ref.max():.3f} "
+        f"mean={ref.mean():.3f} std={ref.std():.3f})"
+    )
 
 
 def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str]:
@@ -67,7 +111,14 @@ def link_then_run() -> tuple[bool, str]:
         if rc != 0:
             log.append("[FAIL] link step returned non-zero")
             return False, "\n".join(log)
-    rc, out = _run([str(SMOKE_BIN)])
+
+    try:
+        log.append(prepare_phase2e_inputs())
+    except Exception as e:
+        log.append(f"[FAIL] prepare_phase2e_inputs: {e!r}")
+        return False, "\n".join(log)
+
+    rc, out = _run([str(SMOKE_BIN), str(ACT_BIN), str(WGT_BIN), str(REF_BIN)])
     log.append(out)
     if rc == 0:
         log.append("[OK] kernel launched and stream synced")
