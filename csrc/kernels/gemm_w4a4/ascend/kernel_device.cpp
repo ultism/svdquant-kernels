@@ -185,13 +185,21 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
         set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
+        // When the K-block count is smaller than the ring depth, back-
+        // pressure in the loop never triggers. The drain loop below
+        // must then consume exactly the produced count, not kPreloadNum.
+        // (Same idiom as Phase 2d's kActualPreload — without it, kNumKBlocks
+        // < kPreloadNum deadlocks waiting on signals vec never sends.)
+        constexpr uint32_t kActualPreload =
+            (kPreloadNum < kNumKBlocks) ? kPreloadNum : kNumKBlocks;
+
         for (uint32_t kb = 0; kb < kNumKBlocks; ++kb) {
             const uint64_t pingpong = kb & 1;
             const uint32_t slot     = kb % kRingSlots;
 
             // Back-pressure: after the ring's filled once, vec must
             // free a slot for each subsequent producer iter.
-            if (kb >= kPreloadNum) {
+            if (kb >= kActualPreload) {
                 wait_flag_dev(VEC_TILE_CONSUMED);
             }
 
@@ -232,10 +240,12 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         // Drain trailing FIX→M gate.
         wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
-        // Drain trailing VEC_TILE_CONSUMED signals — vec fires once
-        // per K-block (32 times); cube only waited (32 - kPreloadNum)
-        // times in the loop, so kPreloadNum signals are still queued.
-        for (uint32_t i = 0; i < kPreloadNum; ++i) {
+        // Drain trailing VEC_TILE_CONSUMED signals. Vec fires once per
+        // K-block (kNumKBlocks total); cube only consumed
+        // max(0, kNumKBlocks - kActualPreload) of them in the loop,
+        // leaving kActualPreload pending here. With kNumKBlocks=2 and
+        // kActualPreload=2, that's 2 drains — matches what vec sent.
+        for (uint32_t i = 0; i < kActualPreload; ++i) {
             wait_flag_dev(VEC_TILE_CONSUMED);
         }
     }
