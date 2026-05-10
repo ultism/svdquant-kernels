@@ -98,6 +98,7 @@ g++ -O2 -std=c++17 -fPIC -shared \
     -I"${HERE}/../csrc/python/host" \
     -I"${REPO}/csrc/kernels/gemm_w4a4/include" \
     -I"${REPO}/csrc/common/include" \
+    -I"${HERE}/objects" \
     -I"${ASCEND}/include" \
     -I"${TORCH_PATH}/include" \
     -I"${TORCH_PATH}/include/torch/csrc/api/include" \
