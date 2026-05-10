@@ -36,6 +36,15 @@ set -euo pipefail
 export USER="${USER:-svdquant}"
 export HOME="${HOME:-/tmp}"
 
+# CANN's ascendalog/ascend_dump libraries write `[LOG_WARNING] can not
+# create directory ...` *to stdout* (yes, stdout, not stderr) during
+# torch_npu import — the warning gets concatenated with the path our
+# `python -c "print(torch.__file__)"` substitution returns, and g++
+# then sees garbage-prefixed -I/-L flags. Mute the CANN logger so the
+# `$(python -c ...)` paths come back clean.
+export ASCEND_SLOG_PRINT_TO_STDOUT=0
+export ASCEND_GLOBAL_LOG_LEVEL=3
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "${HERE}/.." && pwd)"
 ASCEND="${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}"
@@ -59,11 +68,21 @@ done
 # Discover torch + torch_npu install paths from the running interpreter.
 # Querying via Python keeps the script independent of distro layout;
 # Space's image carries both packages on the default python3 path.
+#
+# Use a sentinel-prefixed line + `${var##*=}` extraction so any extra
+# stdout text (e.g. CANN logger spam that env vars above don't fully
+# silence) gets stripped — the marker forces the path to the suffix
+# of our captured variable regardless of what the library wrote first.
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-TORCH_PATH=$("${PYTHON_BIN}" -c "import os, torch; print(os.path.dirname(torch.__file__))")
-TORCH_NPU_PATH=$("${PYTHON_BIN}" -c "import os, torch_npu; print(os.path.dirname(torch_npu.__file__))")
-CXX11_ABI=$("${PYTHON_BIN}" -c "import torch; print(1 if torch.compiled_with_cxx11_abi() else 0)")
+_TP_RAW=$("${PYTHON_BIN}" -c "import os, torch; print('SVDQ_VAL=' + os.path.dirname(torch.__file__))" 2>/dev/null)
+TORCH_PATH="${_TP_RAW##*SVDQ_VAL=}"
+
+_TN_RAW=$("${PYTHON_BIN}" -c "import os, torch_npu; print('SVDQ_VAL=' + os.path.dirname(torch_npu.__file__))" 2>/dev/null)
+TORCH_NPU_PATH="${_TN_RAW##*SVDQ_VAL=}"
+
+_AB_RAW=$("${PYTHON_BIN}" -c "import torch; print('SVDQ_VAL=' + ('1' if torch.compiled_with_cxx11_abi() else '0'))" 2>/dev/null)
+CXX11_ABI="${_AB_RAW##*SVDQ_VAL=}"
 
 if [[ -z "${TORCH_PATH}" || -z "${TORCH_NPU_PATH}" ]]; then
     echo "[link_op_extension] could not resolve torch/torch_npu install paths" >&2
