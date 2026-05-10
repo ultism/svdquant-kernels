@@ -148,6 +148,42 @@ class TestGemmW4A4Phase3aInt4(unittest.TestCase):
             f"mean_abs={partial_diff.float().mean().item():.2f}"
         )
 
+        # ----- 3a-bisect-3: vec-internal partial dump (post-TCVT i32→f32) -----
+        # Kernel TSTORE'd `partF32` right after `TCVT(partF32, partI32)`
+        # into workspace slots 2/3 (reinterpreted as fp32). Compare against
+        # ws[0].float() / ws[1].float() — should match exactly modulo
+        # CAST_RINT (no rounding for ints in [-3584, 3136], all exactly
+        # representable in fp32). If mismatch → in-place TCVT corrupts.
+        ws_f32 = workspace.cpu().view(torch.float32)  # bytewise reinterpret
+        debug_part0 = ws_f32[2]    # post-TCVT for K-block 0
+        debug_part1 = ws_f32[3]    # post-TCVT for K-block 1
+        _step("  vec post-TCVT i32→f32 dump (workspace slot 2/3 viewed as fp32)")
+        _step(f"  debug_part0[0, 0:8] = {debug_part0[0, 0:8].tolist()}")
+        _step(f"  debug_part0[1, 0:8] = {debug_part0[1, 0:8].tolist()}")
+        _step(f"  debug_part0[16, 0:8] = {debug_part0[16, 0:8].tolist()}")
+        _step(f"  debug_part0[32, 0:8] = {debug_part0[32, 0:8].tolist()}  (subblock 1's first row)")
+        ws0_f32 = ws_cpu[0].float()
+        ws1_f32 = ws_cpu[1].float()
+        d0_diff = (debug_part0 - ws0_f32).abs()
+        d1_diff = (debug_part1 - ws1_f32).abs()
+        _step(
+            f"  debug_part0 vs ws[0].float(): max_abs={d0_diff.max().item():.4f} "
+            f"mean_abs={d0_diff.mean().item():.4f} "
+            f"any_nan={debug_part0.isnan().any().item()} "
+            f"any_inf={debug_part0.isinf().any().item()}"
+        )
+        _step(
+            f"  debug_part1 vs ws[1].float(): max_abs={d1_diff.max().item():.4f} "
+            f"mean_abs={d1_diff.mean().item():.4f} "
+            f"any_nan={debug_part1.isnan().any().item()} "
+            f"any_inf={debug_part1.isinf().any().item()}"
+        )
+        _step(
+            f"  debug_part0 stats: min={debug_part0.min().item():.2f} "
+            f"max={debug_part0.max().item():.2f} "
+            f"mean={debug_part0.mean().item():.2f}"
+        )
+
         _step("  comparing to ref")
         out_cpu = out.cpu()
 

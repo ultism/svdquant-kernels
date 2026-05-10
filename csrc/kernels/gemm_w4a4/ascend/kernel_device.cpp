@@ -399,6 +399,30 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             pto::TCVT(ascaleF32, ascaleF16, pto::RoundMode::CAST_RINT);
             pto::TCVT(wscaleF32, wscaleF16, pto::RoundMode::CAST_RINT);
 
+            // 3a-bisect-3: snapshot partF32 right after TCVT i32→f32 and
+            // before TROWEXPANDMUL into unused workspace slots 2/3 (slots
+            // 0/1 hold cube int32 partials). Reinterpret as fp32 so caller
+            // can compare against `workspace[0].float()` without touching
+            // DeviceParams. Drop after the in-place TCVT vs expandmul
+            // bisect resolves.
+            if (kb < 2u) {
+                using GlobalDebugF32 = pto::GlobalTensor<float,
+                    pto::Shape<1, 1, 1, kVecM, kBN>,
+                    pto::Stride<1, 1, 1, kBN, 1>>;
+                auto* ws_f32 = reinterpret_cast<__gm__ float*>(ws_gm);
+                const uint64_t debug_off =
+                    (uint64_t)(kb + 2) * kBM * kBN + (uint64_t)row_off * kBN;
+                GlobalDebugF32 debugGm(ws_f32 + debug_off);
+
+                // V → MTE3: TCVT must finish before TSTORE reads partF32
+                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+                TSTORE(debugGm, partF32);
+                // MTE3 → V: TSTORE must finish before TROWEXPANDMUL writes partF32
+                set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+                wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+            }
+
             // partF32[m,n] *= ascaleF32[m]
             pto::TROWEXPANDMUL(partF32, partF32, ascaleF32);
             // partF32[m,n] *= wscaleF32[n]
