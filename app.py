@@ -99,21 +99,23 @@ def link_then_test() -> tuple[bool, str]:
         _step(log, "[FAIL] link step returned non-zero")
         return False, "\n".join(log)
 
-    _step(log, "[boot] running pytest tests/...")
+    _step(log, "[boot] running unittest tests/...")
     # PYTHONPATH adds csrc/python so `import op_extension` resolves.
+    # We use stdlib `unittest` (not pytest) because Space's image
+    # ships torch but not pytest and pip install may be blocked.
     env = dict(os.environ)
     env["PYTHONPATH"] = (
         f"{ROOT / 'csrc' / 'python'}:{ROOT}:" + env.get("PYTHONPATH", "")
     )
-    pytest_cmd = [sys.executable, "-m", "pytest", "-v", "-s",
-                  str(ROOT / "tests")]
-    pretty = " ".join(shlex.quote(c) for c in pytest_cmd)
+    test_cmd = [sys.executable, "-m", "unittest", "discover",
+                "-v", "-s", str(ROOT / "tests"), "-t", str(ROOT)]
+    pretty = " ".join(shlex.quote(c) for c in test_cmd)
     try:
         proc = subprocess.run(
-            pytest_cmd, env=env, capture_output=True, text=True, timeout=300,
+            test_cmd, env=env, capture_output=True, text=True, timeout=300,
         )
     except subprocess.TimeoutExpired:
-        _step(log, f"$ {pretty}\n<<pytest timed out after 300s>>")
+        _step(log, f"$ {pretty}\n<<unittest timed out after 300s>>")
         return False, "\n".join(log)
     _step(log, f"$ {pretty}\n--- stdout ---\n{proc.stdout}\n"
                 f"--- stderr ---\n{proc.stderr}\nexit: {proc.returncode}\n")
@@ -121,7 +123,7 @@ def link_then_test() -> tuple[bool, str]:
         _step(log, "[OK] all tests passed")
         return True, "\n".join(log)
 
-    _step(log, f"[FAIL] pytest exited {proc.returncode}")
+    _step(log, f"[FAIL] unittest exited {proc.returncode}")
     try:
         # Surface any uncaught exception in the test module.
         traceback.print_exc()

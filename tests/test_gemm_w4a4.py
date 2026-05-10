@@ -15,13 +15,18 @@ binary, only now driven via the proper torch op extension:
 Phase 3 collapses the cube-ring scratch out of `out` and adds
 ascales/wscales/lora_*/bias to the op signature; the test layout
 becomes simpler (no slicing, no tile averaging) at that point.
+
+Uses stdlib `unittest` rather than `pytest` because the GitCode Space
+image (ubuntu22-cann8.5-py311-torch2.8-gradio6.9) ships torch but not
+pytest, and `pip install` may be blocked depending on container policy.
+unittest is in stdlib so always available.
 """
 
 import sys
+import unittest
 from pathlib import Path
 
 import numpy as np
-import pytest
 import torch
 import torch_npu  # noqa: F401  — registers PrivateUse1 backend
 
@@ -57,28 +62,36 @@ def _vec_out_tile(out_flat: torch.Tensor, tile_idx: int) -> torch.Tensor:
     )
 
 
-def test_gemm_w4a4_phase2f_mock():
-    if not torch.npu.is_available():
-        pytest.skip("Ascend NPU not available")
+class TestGemmW4A4Phase2fMock(unittest.TestCase):
 
-    act_np, wgt_np = make_inputs(PHASE2F_M, PHASE2F_K, PHASE2F_N)
-    ref_np = mock_gemm(act_np, wgt_np, scale=PHASE2F_SCALE).astype(np.float32)
-    ref = torch.from_numpy(ref_np)
+    def test_phase2f_mock(self):
+        if not torch.npu.is_available():
+            self.skipTest("Ascend NPU not available")
 
-    act = torch.from_numpy(act_np).npu()
-    wgt = torch.from_numpy(wgt_np).npu()
+        act_np, wgt_np = make_inputs(PHASE2F_M, PHASE2F_K, PHASE2F_N)
+        ref_np = mock_gemm(act_np, wgt_np, scale=PHASE2F_SCALE).astype(np.float32)
+        ref = torch.from_numpy(ref_np)
 
-    out = torch.ops.svdquant.gemm_w4a4(act, wgt)
-    torch.npu.synchronize()
+        act = torch.from_numpy(act_np).npu()
+        wgt = torch.from_numpy(wgt_np).npu()
 
-    # Every vec_out tile in mock mode produces the same value (kernel
-    # loops the same input through num_tiles slots). Pull tile 0 and
-    # also confirm tiles 1..N-1 match it bit-for-bit.
-    out_cpu = out.cpu()
-    tile_0 = _vec_out_tile(out_cpu, 0)
-    for t in range(1, PHASE2F_NUM_TILES):
-        tile_t = _vec_out_tile(out_cpu, t)
-        torch.testing.assert_close(tile_t, tile_0, rtol=0.0, atol=0.0,
-                                    msg=f"mock kernel produced different output at tile {t} vs 0")
+        out = torch.ops.svdquant.gemm_w4a4(act, wgt)
+        torch.npu.synchronize()
 
-    torch.testing.assert_close(tile_0, ref, rtol=1e-2, atol=1e-2)
+        # Every vec_out tile in mock mode produces the same value (kernel
+        # loops the same input through num_tiles slots). Pull tile 0 and
+        # also confirm tiles 1..N-1 match it bit-for-bit.
+        out_cpu = out.cpu()
+        tile_0 = _vec_out_tile(out_cpu, 0)
+        for t in range(1, PHASE2F_NUM_TILES):
+            tile_t = _vec_out_tile(out_cpu, t)
+            torch.testing.assert_close(
+                tile_t, tile_0, rtol=0.0, atol=0.0,
+                msg=f"mock kernel produced different output at tile {t} vs 0",
+            )
+
+        torch.testing.assert_close(tile_0, ref, rtol=1e-2, atol=1e-2)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
