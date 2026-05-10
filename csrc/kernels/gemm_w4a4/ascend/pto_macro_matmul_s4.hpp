@@ -34,21 +34,18 @@
 
 namespace pto {
 
-// L0 ping-pong byte offsets for INT4 cube tiles. Sized for the 3a
-// production tile (BM=128, BN=256, KS_packed=32):
-//   L0A buf: BM × KS_packed = 4 KB  →  ping-pong stride 0x1000
-//   L0B buf: KS_packed × BN = 8 KB  →  ping-pong stride 0x2000
-// L0A is 64 KB total (room for 16 such bufs); ping-pong needs 2.
-// L0B is 64 KB total; ping-pong needs 2.
-//
-// These macros parameterize on byte counts so a different tile shape
-// in 3b/3c can override them by re-#define'ing before include — the
-// same helper works for any shape that fits the L0 budget.
+// L0 ping-pong byte offsets for INT4 cube tiles. The buffer size only
+// has to be ≥ BM × KS_packed (A side) and ≥ KS_packed × BN (B side);
+// L0A and L0B are 64 KB each, so we can give every ping-pong slot
+// 8 KB (= 0x2000) of room and still fit 8 buffers — comfortably
+// covering both the 3a starter tile (BM=64, BN=128) and the 3a-cont
+// production tile (BM=128, BN=256). Different tile shapes can still
+// override by re-#define'ing before include.
 #ifndef SVDQ_S4_L0A_BYTES_PER_BUF
-#define SVDQ_S4_L0A_BYTES_PER_BUF 0x1000  // 4 KB (BM=128 × KS_packed=32)
+#define SVDQ_S4_L0A_BYTES_PER_BUF 0x2000  // 8 KB
 #endif
 #ifndef SVDQ_S4_L0B_BYTES_PER_BUF
-#define SVDQ_S4_L0B_BYTES_PER_BUF 0x2000  // 8 KB (KS_packed=32 × BN=256)
+#define SVDQ_S4_L0B_BYTES_PER_BUF 0x2000  // 8 KB
 #endif
 
 // Issue one K-block of INT4 cube MMA.

@@ -56,9 +56,9 @@ _step("  baseline ref_int4 loaded OK")
 
 
 # Phase 3a tile constants — must match svdquant_w4a4_op.cpp + kernel_device.cpp.
-PHASE3A_M = 128
-PHASE3A_K = 2048
-PHASE3A_N = 256
+PHASE3A_M = 64
+PHASE3A_K = 128
+PHASE3A_N = 128
 PHASE3A_R = 1     # LoRA rank for the zero-stub residual (smallest valid).
 
 

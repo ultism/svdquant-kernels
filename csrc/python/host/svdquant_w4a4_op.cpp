@@ -28,9 +28,9 @@ constexpr auto kNpuDevice = c10::DeviceType::PrivateUse1;
 // Phase 3a tile is hardcoded — must match
 // `csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp` constexpr block.
 // Tile-parameterization comes in Phase 3b/3c.
-constexpr int64_t kPhase3aM         = 128;
-constexpr int64_t kPhase3aK         = 2048;
-constexpr int64_t kPhase3aN         = 256;
+constexpr int64_t kPhase3aM         = 64;
+constexpr int64_t kPhase3aK         = 128;
+constexpr int64_t kPhase3aN         = 128;
 constexpr int64_t kPhase3aBlockSize = 64;        // K-block / mad_s4 KS
 constexpr int64_t kPhase3aRingSlots = 6;
 

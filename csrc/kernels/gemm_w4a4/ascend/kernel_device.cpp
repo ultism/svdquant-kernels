@@ -96,10 +96,13 @@ struct DeviceParams {
     __gm__ half*    out;        // [128, 256]   fp16 final
 };
 
-// Tile shape constants — pinned for 3a single-tile.
-constexpr uint32_t kBM         = 128;
-constexpr uint32_t kBN         = 256;
-constexpr uint32_t kBKLogical  = 2048;
+// Tile shape constants — pinned for 3a single-tile. Starting smaller
+// (matching Phase 2d's mock shape M=64 K=128 N=128) to localize a
+// runtime UB-OOB on AIV; once data path is correct, scale up to the
+// production target M=128 K=2048 N=256 in 3a-cont.
+constexpr uint32_t kBM         = 64;
+constexpr uint32_t kBN         = 128;
+constexpr uint32_t kBKLogical  = 128;
 constexpr uint32_t kBKPacked   = kBKLogical / 2;
 constexpr uint32_t kKSLogical  = 64;                   // mad_s4 K-block / scale block
 constexpr uint32_t kKSPacked   = kKSLogical / 2;       // 32 packed bytes
