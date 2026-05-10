@@ -47,6 +47,7 @@
 #include <pto/pto-inst.hpp>
 
 #include "pto_macro_matmul.hpp"
+#include "phase3_sanity.hpp"
 
 constexpr KernelMetaType __enable_feature_for_compile_default = KERNEL_TYPE_MIX_AIC_1_2;
 
@@ -116,6 +117,20 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         auto* act_gm = p->act;
         auto* wgt_gm = p->wgt;
         auto* out_gm = p->out;
+
+        // Phase 3a-min compile-only probe — see phase3_sanity.hpp. The
+        // volatile gate prevents DCE so ccec actually instantiates the
+        // uint8/int8 Tile templates and emits the raw mad_s4 op; the
+        // call itself never executes (gate is read-only false). Goal is
+        // to fail-fast at cross-build if the vendored a2a3 PTO snapshot
+        // rejects the s4 type plumbing.
+        volatile bool phase3_compile_gate = false;
+        if (phase3_compile_gate) {
+            svdquant_phase3::phase3_int4_compile_probe(
+                (__gm__ int8_t*)act_gm,
+                (__gm__ int8_t*)wgt_gm,
+                (__gm__ int32_t*)out_gm);
+        }
 
         // Tile + GM types are independent of tile_idx; declare once.
         // L1: A row-major bulk + row-major sub-fractal; B row-major
