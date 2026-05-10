@@ -107,8 +107,12 @@ def link_then_test() -> tuple[bool, str]:
     env["PYTHONPATH"] = (
         f"{ROOT / 'csrc' / 'python'}:{ROOT}:" + env.get("PYTHONPATH", "")
     )
-    test_cmd = [sys.executable, "-m", "unittest", "discover",
-                "-v", "-s", str(ROOT / "tests"), "-t", str(ROOT)]
+    # Run the test file directly via its `if __name__ == '__main__'`
+    # entry rather than `unittest discover`, which would require
+    # tests/ to be a Python package (an __init__.py we don't want
+    # because it interferes with future pytest layouts). Direct
+    # invocation is the safest cross-runner pattern.
+    test_cmd = [sys.executable, str(ROOT / "tests" / "test_gemm_w4a4.py")]
     pretty = " ".join(shlex.quote(c) for c in test_cmd)
     try:
         proc = subprocess.run(
