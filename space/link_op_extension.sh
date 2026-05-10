@@ -28,6 +28,14 @@
 
 set -euo pipefail
 
+# GitCode Space container runs as uid=1000 with no /etc/passwd entry —
+# torch._inductor.codecache calls getpass.getuser() at module init and
+# crashes on KeyError. Set USER so getpass short-circuits to env before
+# the pwd fallback. (app.py also sets this; defensive when the script
+# is invoked standalone.)
+export USER="${USER:-svdquant}"
+export HOME="${HOME:-/tmp}"
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "${HERE}/.." && pwd)"
 ASCEND="${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}"

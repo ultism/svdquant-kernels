@@ -31,6 +31,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+# GitCode Space's container runs as uid=1000 but `/etc/passwd` has no
+# matching entry, so `getpass.getuser()` fails with `KeyError: getpwuid()`
+# the moment torch's `_inductor.codecache` initializes (it sanitizes the
+# cache dir by username). Setting USER (or LOGNAME / LNAME / USERNAME)
+# short-circuits getpass.getuser() before it falls back to pwd lookup.
+# Subprocess calls (link script, pytest) inherit this env.
+os.environ.setdefault("USER", "svdquant")
+os.environ.setdefault("HOME", os.environ.get("HOME") or "/tmp")
+
 import gradio as gr
 
 ROOT = Path(__file__).resolve().parent
