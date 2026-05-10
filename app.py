@@ -97,33 +97,47 @@ def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str]:
     return proc.returncode, out
 
 
+def _step(log: list[str], msg: str) -> None:
+    """Stream-print so the container log keeps progress even if the
+    container dies mid-pipeline. INITIAL_OUTPUT is printed at the end
+    too (for the Gradio textbox), but this is the source of truth
+    while the run is in flight."""
+    print(msg, flush=True)
+    log.append(msg)
+
+
 def link_then_run() -> tuple[bool, str]:
+    import traceback
     log: list[str] = []
-    log.append(f"ASCEND_HOME_PATH={os.environ.get('ASCEND_HOME_PATH', '<unset>')}")
-    log.append(f"smoke binary present: {SMOKE_BIN.exists()}")
+    _step(log, f"[boot] ASCEND_HOME_PATH={os.environ.get('ASCEND_HOME_PATH', '<unset>')}")
+    _step(log, f"[boot] smoke binary present: {SMOKE_BIN.exists()}")
     if not SMOKE_BIN.exists():
+        _step(log, "[boot] linking smoke binary...")
         try:
             os.chmod(LINK_SCRIPT, 0o755)
         except OSError:
             pass
         rc, out = _run(["bash", str(LINK_SCRIPT)])
-        log.append(out)
+        _step(log, out)
         if rc != 0:
-            log.append("[FAIL] link step returned non-zero")
+            _step(log, "[FAIL] link step returned non-zero")
             return False, "\n".join(log)
 
+    _step(log, "[boot] preparing Phase 2e inputs (numpy mock_gemm → /tmp/.bin)...")
     try:
-        log.append(prepare_phase2e_inputs())
+        _step(log, prepare_phase2e_inputs())
     except Exception as e:
-        log.append(f"[FAIL] prepare_phase2e_inputs: {e!r}")
+        _step(log, f"[FAIL] prepare_phase2e_inputs: {e!r}")
+        _step(log, traceback.format_exc())
         return False, "\n".join(log)
 
+    _step(log, "[boot] running smoke binary with argv = act/wgt/ref paths...")
     rc, out = _run([str(SMOKE_BIN), str(ACT_BIN), str(WGT_BIN), str(REF_BIN)])
-    log.append(out)
+    _step(log, out)
     if rc == 0:
-        log.append("[OK] kernel launched and stream synced")
+        _step(log, "[OK] kernel launched and stream synced")
         return True, "\n".join(log)
-    log.append(f"[FAIL] smoke exited {rc}")
+    _step(log, f"[FAIL] smoke exited {rc}")
     return False, "\n".join(log)
 
 
