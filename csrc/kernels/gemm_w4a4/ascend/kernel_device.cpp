@@ -251,6 +251,29 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
     }
 
     if ASCEND_IS_AIV {
+        // PTO mix-mode AIV vector mask is NOT in a known reset state at
+        // entry — TROWEXPANDMUL/TCOLEXPANDMUL/TRowMin etc. internally set
+        // a per-line mask (e.g. `set_vector_mask(0, elementsPerLine)`)
+        // and don't always restore it before the next op. Whatever
+        // residue was left by a previous ASCEND_IS_AIV invocation, or
+        // even by hardware power-on default, is what subsequent
+        // TLOAD/TCVT/TADD pick up — which, when wrong, makes those ops
+        // address a UB region they shouldn't, manifesting as either
+        // VEC ub-out-of-bounds (subErrType:4) or, worse, silently-wrong
+        // values that decode as ±inf/NaN if the mask happens to make
+        // the load land somewhere accessible. PTO's own TColReduceOps.hpp:31
+        // and TRowMin.hpp:94 follow exactly this idiom for the same
+        // reason; reference: gitcode.com/cann/pto-isa/issues/218 (a vec
+        // OOB with byte-identical signature was solved by zhangjian_hz11
+        // adding precisely this two-line reset).
+        // Both ops are CCE intrinsics (kernel_operator headers); on
+        // dav_c220 they emit a single-instruction state write. Cost is
+        // negligible (~2 cycles total).
+#if __CCE_AICORE__ == 220 && defined(__DAV_C220_VEC__)
+        set_mask_norm();
+        set_vector_mask(-1, -1);
+#endif
+
         auto* ws_gm  = p->workspace;
         auto* as_gm  = p->ascales;
         auto* wsl_gm = p->wscales;
