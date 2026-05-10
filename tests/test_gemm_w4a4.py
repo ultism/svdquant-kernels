@@ -93,14 +93,60 @@ class TestGemmW4A4Phase3aInt4(unittest.TestCase):
         _step("  inputs on NPU OK")
 
         _step("  calling torch.ops.svdquant.gemm_w4a4")
-        out = torch.ops.svdquant.gemm_w4a4(
+        out, workspace = torch.ops.svdquant.gemm_w4a4(
             act_npu, wgt_npu, ascales_npu, wscales_npu
         )
         _step("  op returned, syncing")
         torch.npu.synchronize()
         _step(f"  sync OK, out shape {tuple(out.shape)} dtype {out.dtype}")
+        _step(f"           workspace shape {tuple(workspace.shape)} dtype {workspace.dtype}")
         self.assertEqual(out.shape, (PHASE3A_M, PHASE3A_N))
         self.assertEqual(out.dtype, torch.float16)
+
+        # ----- partial-dump bisect: did cube write sane int32 partials? -----
+        # workspace[slot, m, n] is what cube TSTORE'd post-mad_s4 for the
+        # kb=slot-th K-block. With M=64, K=128, N=128 and KS=64, slots 0
+        # and 1 should each hold a [64, 128] int32 partial in the range
+        # roughly [-3584, 3136] (= 64-elt sum of signed-INT4 products,
+        # ±8 × ±8 × 64). Anything wildly outside that band means cube
+        # produced garbage; all-zero means cube didn't write at all.
+        _step("  inspecting cube partial via workspace[0]")
+        ws_cpu = workspace.cpu()
+        _step(f"  ws[0, 0, 0:8] = {ws_cpu[0, 0, 0:8].tolist()}")
+        _step(f"  ws[0, 1, 0:8] = {ws_cpu[0, 1, 0:8].tolist()}")
+        _step(f"  ws[0, 16, 0:8] = {ws_cpu[0, 16, 0:8].tolist()}  (start of 2nd m-fractal)")
+        _step(f"  ws[0, 32, 0:8] = {ws_cpu[0, 32, 0:8].tolist()}  (subblock 1's first row)")
+        _step(f"  ws[0, 63, 0:8] = {ws_cpu[0, 63, 0:8].tolist()}  (last row)")
+        _step(
+            f"  ws[0] stats: min={ws_cpu[0].min().item()} "
+            f"max={ws_cpu[0].max().item()} "
+            f"mean={ws_cpu[0].float().mean().item():.2f} "
+            f"nonzero_rows={(ws_cpu[0].abs().sum(dim=1) > 0).sum().item()}"
+        )
+        _step(
+            f"  ws[1] stats: min={ws_cpu[1].min().item()} "
+            f"max={ws_cpu[1].max().item()} "
+            f"mean={ws_cpu[1].float().mean().item():.2f} "
+            f"nonzero_rows={(ws_cpu[1].abs().sum(dim=1) > 0).sum().item()}"
+        )
+        # Compute expected partial[0] from inputs to compare against.
+        # ref_partial[m, n] = sum_{k in K-block 0} act_int4[m, k] * wgt_int4[n, k]
+        from baseline.kernels._int4 import _unpack_signed_nibbles  # noqa: E402
+        act_int = _unpack_signed_nibbles(act).to(torch.int32)
+        wgt_int = _unpack_signed_nibbles(wgt).to(torch.int32)
+        ref_partial0 = (act_int[:, :64] @ wgt_int[:, :64].T)
+        _step(f"  ref_partial0[0, 0:8] = {ref_partial0[0, 0:8].tolist()}")
+        _step(f"  ref_partial0[1, 0:8] = {ref_partial0[1, 0:8].tolist()}")
+        _step(
+            f"  ref_partial0 stats: min={ref_partial0.min().item()} "
+            f"max={ref_partial0.max().item()} "
+            f"mean={ref_partial0.float().mean().item():.2f}"
+        )
+        partial_diff = (ws_cpu[0] - ref_partial0).abs()
+        _step(
+            f"  ws[0] vs ref_partial0: max_abs={partial_diff.max().item()} "
+            f"mean_abs={partial_diff.float().mean().item():.2f}"
+        )
 
         _step("  comparing to ref")
         out_cpu = out.cpu()

@@ -3,12 +3,17 @@
 // Registers a single op into the `svdquant` namespace's PrivateUse1
 // (NPU) dispatch table:
 //
-//   torch.ops.svdquant.gemm_w4a4(act, wgt, ascales, wscales) -> Tensor
+//   torch.ops.svdquant.gemm_w4a4(act, wgt, ascales, wscales)
+//       -> (Tensor out_fp16, Tensor workspace_int32)
 //
 // Inputs are packed signed-INT4 activation + weight + matching per-
-// 64-K-block fp16 scales. Output is fp16 [M, N]. Workspace for the
-// cube/vec int32 ring is allocated here (caching alloc, scoped to
-// the call) and not exposed to the caller.
+// 64-K-block fp16 scales. Output is fp16 [M, N]. The workspace
+// [kRingSlots, M, N] int32 cube/vec ring is also surfaced as a second
+// return so the test side can inspect what cube actually wrote pre-
+// dequant — the bisect step for "vec sees garbage" vs "cube produces
+// garbage" with the row-0-±inf-row-1+-zero pattern. Exposed here, not
+// in 3b/3c — once numerics pass and the partial-dump is no longer
+// needed, drop the workspace from the return.
 //
 // Phase 3b/3c will extend to (act, wgt, ascales, wscales, lora_act_in,
 // lora_up, bias?, wcscales?, smooth_next?) and return a tuple with
@@ -34,10 +39,11 @@ constexpr int64_t kPhase3aN         = 128;
 constexpr int64_t kPhase3aBlockSize = 64;        // K-block / mad_s4 KS
 constexpr int64_t kPhase3aRingSlots = 6;
 
-at::Tensor run_gemm_w4a4(const at::Tensor& act,
-                         const at::Tensor& wgt,
-                         const at::Tensor& ascales,
-                         const at::Tensor& wscales)
+std::tuple<at::Tensor, at::Tensor>
+run_gemm_w4a4(const at::Tensor& act,
+              const at::Tensor& wgt,
+              const at::Tensor& ascales,
+              const at::Tensor& wscales)
 {
     TORCH_CHECK(act.device().type() == kNpuDevice,
                 "act must be a NPU tensor (PrivateUse1)");
@@ -72,12 +78,10 @@ at::Tensor run_gemm_w4a4(const at::Tensor& act,
     auto fp16_options = act.options().dtype(at::kHalf);
     auto i32_options  = act.options().dtype(at::kInt);
 
-    // Workspace = cube/vec hand-off ring of int32 partials. Caching
-    // allocator keeps re-alloc cost ~free across calls. Lifetime
-    // ends with this `at::Tensor` going out of scope at function exit.
-    // Use zeros (not empty) so stale garbage can't masquerade as a
-    // cube-written partial if a slot is read before it's filled —
-    // makes "vec read garbage" visible as zero output rather than inf.
+    // Workspace = cube/vec hand-off ring of int32 partials. Zero-init
+    // so any slot the cube didn't write reads as 0 in the surfaced
+    // tensor (distinguishes "cube didn't write here" from "cube wrote
+    // garbage").
     auto workspace = at::zeros(
         {kPhase3aRingSlots, kPhase3aM, kPhase3aN}, i32_options);
     auto out = at::empty({kPhase3aM, kPhase3aN}, fp16_options);
@@ -91,7 +95,7 @@ at::Tensor run_gemm_w4a4(const at::Tensor& act,
         workspace.data_ptr(),
         out.data_ptr(),
         static_cast<void*>(stream));
-    return out;
+    return std::make_tuple(out, workspace);
 }
 
 }  // namespace svdquant_op
@@ -103,7 +107,8 @@ TORCH_LIBRARY_FRAGMENT(svdquant, m)
     // Phase 3a schema — INT4 main path (no LoRA / bias / wcscales /
     // next-layer quant yet). Phase 3b/3c append optional Tensors and
     // turn the return type into a tuple to surface qout / oscales.
-    m.def("gemm_w4a4(Tensor act, Tensor wgt, Tensor ascales, Tensor wscales) -> Tensor");
+    m.def("gemm_w4a4(Tensor act, Tensor wgt, Tensor ascales, Tensor wscales) "
+          "-> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(svdquant, PrivateUse1, m)
