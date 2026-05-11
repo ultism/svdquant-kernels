@@ -297,13 +297,29 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         // (TMP_UB_OFFSET) using a fixed low UB offset. In-place TCVT
         // i32→f32 is safe at the kernel level (PIPE_V is element-wise);
         // the overlap stays.
-        constexpr uint32_t kPartialOff   = 0;
-        constexpr uint32_t kRunningOff   = kPartialOff + kVecM * kBN * 4;
-        constexpr uint32_t kAscaleF16Off = kRunningOff + kVecM * kBN * 4;
-        constexpr uint32_t kAscaleF32Off = kAscaleF16Off + kVecM * 2;
-        constexpr uint32_t kWscaleF16Off = kAscaleF32Off + kVecM * 4;
-        constexpr uint32_t kWscaleF32Off = kWscaleF16Off + kBN * 2;
-        constexpr uint32_t kOutF16Off    = kPartialOff;  // overlap with partial post-loop
+        // Block size for vbrcb broadcast (32-byte block / sizeof(fp32) = 8).
+        // TROWEXPAND([1, M] RowMajor → [M, 8] RowMajor) requires dst::Cols
+        // == elemPerBlock = 8 (see pto::TROWEXPAND_IMPL isBroadcast check).
+        constexpr uint32_t kBcastCols = 8;
+
+        constexpr uint32_t kPartialOff      = 0;
+        constexpr uint32_t kRunningOff      = kPartialOff + kVecM * kBN * 4;
+        // ascale = per-row M scale. Loaded RowMajor [1, vecM] half (mirror
+        // of wscale's known-working pattern), TCVT to RowMajor [1, vecM]
+        // fp32, then expanded by pto::TROWEXPAND to RowMajor [vecM, 8]
+        // broadcast tile (row r = [s_r] × 8). The broadcast tile is what
+        // TROWEXPANDMUL consumes — feeding it as RowMajor src1 takes the
+        // RowMajor code path that skips PTO's internal vbrcb scratch.
+        // (3a-cycle-15 root cause: ColMajor [vecM, 1] TLOAD from GM only
+        // loads the head element; switching to this load-row + expand
+        // pattern bypasses the bug entirely. See memory note
+        // pto_colmajor_n1_tload_broken.md.)
+        constexpr uint32_t kAscaleF16Off    = kRunningOff + kVecM * kBN * 4;
+        constexpr uint32_t kAscaleF32Off    = kAscaleF16Off + kVecM * 2;
+        constexpr uint32_t kAscaleBcastOff  = kAscaleF32Off + kVecM * 4;
+        constexpr uint32_t kWscaleF16Off    = kAscaleBcastOff + kVecM * kBcastCols * 4;
+        constexpr uint32_t kWscaleF32Off    = kWscaleF16Off + kBN * 2;
+        constexpr uint32_t kOutF16Off       = kPartialOff;  // overlap with partial post-loop
 
         using TilePartialI32 = pto::Tile<pto::TileType::Vec, int32_t, kVecM, kBN,
                                           pto::BLayout::RowMajor, kVecM, kBN>;
@@ -314,12 +330,17 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         using TileOutF16     = pto::Tile<pto::TileType::Vec, half, kVecM, kBN,
                                           pto::BLayout::RowMajor, kVecM, kBN>;
 
-        // ascale = per-row M scale → ColMajor [vecM, 1] (Phase 2c
-        // convention; matches TROWEXPANDMUL src1 contract).
-        using TileAscaleF16 = pto::Tile<pto::TileType::Vec, half, kVecM, 1,
-                                         pto::BLayout::ColMajor, kVecM, 1>;
-        using TileAscaleF32 = pto::Tile<pto::TileType::Vec, float, kVecM, 1,
-                                         pto::BLayout::ColMajor, kVecM, 1>;
+        // ascale RowMajor row tiles (mirror of wscale): 32 contiguous halfs
+        // → 32 contiguous fp32s after TCVT. Then TROWEXPAND broadcasts each
+        // scalar into a 32-byte block (= 8 fp32) along the row axis,
+        // producing the [vecM, 8] tile that TROWEXPANDMUL takes as RowMajor
+        // src1 (without invoking internal vbrcb).
+        using TileAscaleF16    = pto::Tile<pto::TileType::Vec, half,  1, kVecM,
+                                            pto::BLayout::RowMajor, 1, kVecM>;
+        using TileAscaleF32    = pto::Tile<pto::TileType::Vec, float, 1, kVecM,
+                                            pto::BLayout::RowMajor, 1, kVecM>;
+        using TileAscaleBcastF32 = pto::Tile<pto::TileType::Vec, float, kVecM, kBcastCols,
+                                              pto::BLayout::RowMajor, kVecM, kBcastCols>;
         // wscale = per-col N scale → RowMajor [1, BN] (TCOLEXPANDMUL src1).
         using TileWscaleF16 = pto::Tile<pto::TileType::Vec, half, 1, kBN,
                                          pto::BLayout::RowMajor, 1, kBN>;
@@ -329,12 +350,13 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         using GlobalRingSlot = pto::GlobalTensor<int32_t,
             pto::Shape<1, 1, 1, kVecM, kBN>,
             pto::Stride<1, 1, 1, kBN, 1>>;
-        // TLOAD into a ColMajor [vecM, 1] reduce tile must come from a
-        // DN-layout Global (PTO trowexpandmul ST testcase pattern).
+        // Standard RowMajor [1, vecM] half GM strip (same shape pattern as
+        // wscale's GlobalWscaleRow). The previous ColMajor [vecM, 1] +
+        // Layout::DN setup silently TLOAD'd only the head half — see the
+        // memory note pto_colmajor_n1_tload_broken.md.
         using GlobalAscaleRow = pto::GlobalTensor<half,
-            pto::Shape<1, 1, 1, kVecM, 1>,
-            pto::Stride<1, 1, 1, 1, 1>,
-            pto::Layout::DN>;
+            pto::Shape<1, 1, 1, 1, kVecM>,
+            pto::Stride<1, 1, 1, kVecM, 1>>;
         using GlobalWscaleRow = pto::GlobalTensor<half,
             pto::Shape<1, 1, 1, 1, kBN>,
             pto::Stride<1, 1, 1, kBN, 1>>;
@@ -379,20 +401,22 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             const uint64_t wscale_off  = (uint64_t)kb * kBN;
             const uint64_t out_off     = (uint64_t)row_off * kBN;
 
-            TilePartialI32 partI32;
-            TilePartialF32 partF32;
-            TileRunningF32 running;
-            TileAscaleF16  ascaleF16;
-            TileAscaleF32  ascaleF32;
-            TileWscaleF16  wscaleF16;
-            TileWscaleF32  wscaleF32;
-            TASSIGN(partI32,   kPartialOff);
-            TASSIGN(partF32,   kPartialOff);  // in-place i32→f32 cast (see UB layout note above)
-            TASSIGN(running,   kRunningOff);
-            TASSIGN(ascaleF16, kAscaleF16Off);
-            TASSIGN(ascaleF32, kAscaleF32Off);
-            TASSIGN(wscaleF16, kWscaleF16Off);
-            TASSIGN(wscaleF32, kWscaleF32Off);
+            TilePartialI32      partI32;
+            TilePartialF32      partF32;
+            TileRunningF32      running;
+            TileAscaleF16       ascaleF16;
+            TileAscaleF32       ascaleF32;
+            TileAscaleBcastF32  ascaleBcast;
+            TileWscaleF16       wscaleF16;
+            TileWscaleF32       wscaleF32;
+            TASSIGN(partI32,     kPartialOff);
+            TASSIGN(partF32,     kPartialOff);  // in-place i32→f32 cast (see UB layout note above)
+            TASSIGN(running,     kRunningOff);
+            TASSIGN(ascaleF16,   kAscaleF16Off);
+            TASSIGN(ascaleF32,   kAscaleF32Off);
+            TASSIGN(ascaleBcast, kAscaleBcastOff);
+            TASSIGN(wscaleF16,   kWscaleF16Off);
+            TASSIGN(wscaleF32,   kWscaleF32Off);
 
             GlobalRingSlot  partGm  (p->workspace + partial_off);
             GlobalAscaleRow ascaleGm(p->ascales   + ascale_off);
@@ -415,18 +439,16 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             pto::TCVT(ascaleF32, ascaleF16, pto::RoundMode::CAST_RINT);
             pto::TCVT(wscaleF32, wscaleF16, pto::RoundMode::CAST_RINT);
 
-            // 3a-bisect-5a: snapshot ascaleF32 [32, 1] ColMajor tile into
-            // ws slot 6 (kb=0 only). Verifies whether TLOAD+TCVT got all 32
-            // per-row ascale values correct. AIV0 writes 32 fp32 at offset
-            // row_off=0..31 inside ws[6] row 0; AIV1 writes at offset 32..63.
-            // Test reads ws[6, 0, 0:64] and compares against
-            // ascales[0, 0:64].float(). If mismatched → TLOAD/TCVT is the
-            // bug. If matched → bug is downstream (TROWEXPANDMUL/vbrcb).
+            // 3a-bisect-5a (post-cycle-16-fix): snapshot ascaleF32 [1, vecM]
+            // RowMajor tile into ws slot 6 (kb=0 only). Verifies the
+            // RowMajor TLOAD+TCVT loads all kVecM per-row ascale values
+            // correctly. AIV0 writes 32 fp32 at ws[6, 0, 0:32]; AIV1 at
+            // ws[6, 0, 32:64]. Previously this dump showed only [0,0]/[0,32]
+            // correct (ColMajor TLOAD bug); should now show all 64 correct.
             if (kb == 0u) {
                 using GlobalAscaleDebug = pto::GlobalTensor<float,
-                    pto::Shape<1, 1, 1, kVecM, 1>,
-                    pto::Stride<1, 1, 1, 1, 1>,
-                    pto::Layout::DN>;
+                    pto::Shape<1, 1, 1, 1, kVecM>,
+                    pto::Stride<1, 1, 1, kVecM, 1>>;
                 auto* ws_f32 = reinterpret_cast<__gm__ float*>(ws_gm);
                 GlobalAscaleDebug ascale_debug_gm(
                     ws_f32 + 6u * kBM * kBN + row_off);
@@ -462,8 +484,19 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
                 wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
             }
 
-            // partF32[m,n] *= ascaleF32[m]
-            pto::TROWEXPANDMUL(partF32, partF32, ascaleF32);
+            // Expand ascaleF32 [1, vecM] RowMajor → ascaleBcast [vecM, 8]
+            // RowMajor where row r = [s_r] × 8. PTO's TROWEXPAND internally
+            // calls vbrcb on the [1, M] flat row (which is well-defined
+            // because the row tile was loaded via the canonical RowMajor
+            // GM → RowMajor UB path). The resulting [vecM, 8] tile is then
+            // a valid RowMajor src1 for TROWEXPANDMUL: its assertion
+            // `RowMajor src1 && src1ValidCol == 32/sizeof(T) = 8` holds,
+            // and the RowMajor code path skips the internal vbrcb scratch
+            // entirely.
+            pto::TROWEXPAND(ascaleBcast, ascaleF32);
+
+            // partF32[m,n] *= ascaleF32[m]  (via pre-broadcast ascaleBcast)
+            pto::TROWEXPANDMUL(partF32, partF32, ascaleBcast);
 
             // 3a-bisect-4: snapshot partF32 right after TROWEXPANDMUL and
             // before TCOLEXPANDMUL into unused workspace slots 4/5
@@ -490,30 +523,24 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
                 wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
             }
 
-            // 3a-bisect-5b: snapshot vbrcb tmpbuf @ TMP_UB_OFFSET=184KB into
-            // ws slot 7 (kb=0 only). After TROWEXPANDMUL's internal vbrcb,
-            // tmpbuf should contain 32 blocks of 8 fp32 each, where block r
-            // = [s_r] × 8. View as [32, 8] RowMajor. AIV0 dumps to ws[7]
-            // rows 0..31, AIV1 to rows 32..63 (each AIV has its own UB
-            // tmpbuf so the dumps are independent). TCOLEXPANDMUL hasn't
-            // run yet, so tmpbuf still holds the row-broadcast values.
+            // 3a-bisect-5b (post-cycle-16-fix): snapshot ascaleBcast tile
+            // (the manually-built [vecM, 8] RowMajor broadcast scale) into
+            // ws slot 7 (kb=0 only). After pto::TROWEXPAND, each row r
+            // should be [s_r] × 8. AIV0 writes rows 0..31, AIV1 rows
+            // 32..63. Previously this dumped the PTO-internal tmpbuf;
+            // now we dump our user-visible tile that TROWEXPANDMUL
+            // actually consumes.
             if (kb == 0u) {
-                using TileTmpbuf = pto::Tile<pto::TileType::Vec, float,
-                                              kVecM, 8,
-                                              pto::BLayout::RowMajor,
-                                              kVecM, 8>;
-                using GlobalTmpbufDebug = pto::GlobalTensor<float,
-                    pto::Shape<1, 1, 1, kVecM, 8>,
+                using GlobalAscaleBcastDebug = pto::GlobalTensor<float,
+                    pto::Shape<1, 1, 1, kVecM, kBcastCols>,
                     pto::Stride<1, 1, 1, kBN, 1>>;
-                TileTmpbuf tmpbuf;
-                TASSIGN(tmpbuf, pto::TMP_UB_OFFSET);
                 auto* ws_f32 = reinterpret_cast<__gm__ float*>(ws_gm);
-                GlobalTmpbufDebug tmpbuf_debug_gm(
+                GlobalAscaleBcastDebug bcast_debug_gm(
                     ws_f32 + 7u * kBM * kBN + (uint64_t)row_off * kBN);
 
                 set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
                 wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-                TSTORE(tmpbuf_debug_gm, tmpbuf);
+                TSTORE(bcast_debug_gm, ascaleBcast);
                 set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
                 wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
             }
