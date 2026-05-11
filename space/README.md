@@ -64,20 +64,23 @@ objcopy -O binary \
     /tmp/sq_extract/host_stub.cpp.o \
     space/objects/blob.bin
 
-# Cross-compile host_stub.cpp (aarch64), then inject the blob
-aarch64-linux-gnu-g++ -O2 -std=c++17 -I"${CANN}/include" \
-    -c build_ascend/auto_gen/svdquant_gemm_w4a4_device/host_stub.cpp \
+# Cross-compile host_stub.cpp (aarch64), then inject the blob.
+# -fPIC is required: the Space link step builds a shared object
+# (libop_extension.so), and aarch64 ld rejects R_AARCH64_ADR_PREL_PG_HI21
+# relocations from non-PIC code in a shared object.
+aarch64-linux-gnu-g++ -O2 -std=c++17 -fPIC -I"${CANN}/include" \
+    -c build/auto_gen/svdquant_gemm_w4a4_device/host_stub.cpp \
     -o space/objects/host_stub.cpp.o
 aarch64-linux-gnu-objcopy \
     --update-section .ascend.kernel.ascend910b1.svdquant_gemm_w4a4_device=space/objects/blob.bin \
     space/objects/host_stub.cpp.o
 
-# Cross-compile our host launcher
-aarch64-linux-gnu-g++ -O2 -std=c++17 \
+# Cross-compile our host launcher (also -fPIC, same reason)
+aarch64-linux-gnu-g++ -O2 -std=c++17 -fPIC \
     -I"${CANN}/include" \
     -I csrc/kernels/gemm_w4a4/include \
     -I csrc/common/include \
-    -I build_ascend/include/svdquant_gemm_w4a4_device \
+    -I build/include/svdquant_gemm_w4a4_device \
     -c csrc/kernels/gemm_w4a4/ascend/kernel.cpp \
     -o space/objects/kernel.cpp.o
 
