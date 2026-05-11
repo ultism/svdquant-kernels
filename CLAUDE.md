@@ -295,6 +295,53 @@ path — not required for local edit / CUDA runs.
   difference from AscendC is the compiler path (MLIR or Triton → PTX
   instead of `ccec`). Treat them as production surface.
 
+## Record gotchas in the repo, not just memory
+
+When you hit a *silent* misbehavior — kernel compiles, runs,
+produces deterministic-looking numbers that are wrong, OR a doc /
+type system gate the docs don't cover — file the finding into the
+repo before paging the context out. **Do not** rely on memory
+notes alone for this; memory decays and is not visible to
+collaborators or to a fresh `git clone`.
+
+Where to put each finding:
+
+- **CuTe DSL traps (CUDA path):** append to
+  `docs/gotchas/cute_dsl.md`. Examples already there: Python `if`
+  inside `@cute.jit` traces both branches; divide-API nesting
+  differences; 2-CTA `cluster_layout_vmnk` axes;
+  `TiledCopy.partition_D` rest-mode trap; `num_acc_stage` vs
+  `tile_n`.
+- **Ascend / AscendC / PTO ISA traps:** append to
+  `docs/gotchas/ascend.md`. Examples already there: cube↔vec
+  handoff is L2-resident; cube min addressable = 1 byte;
+  `TLoad` of ColMajor `[N, 1]` from GM loads only the head;
+  `TRowExpand` contaminates the vec mask; AIV K-loop reusing a
+  partial UB region needs V→MTE2 cross-iter sync.
+- **Backend-level scope or design decisions** (what's in /
+  out of scope, what tradeoff was settled, why a path was
+  abandoned): `docs/architecture.md` § "Scope decisions".
+- **Perf-comparison context** (counter routing, reference
+  implementation craft level, expected gaps): bottom of
+  `docs/gpu.md` or `docs/npu.md`.
+- **Per-kernel design state and bring-up history**:
+  `docs/kernels/<op>*.md`. The gotcha files are for traps that
+  apply broadly across the backend; one-off bring-up cycles
+  belong in the per-kernel bring-up doc plus the `log/`
+  artifact.
+
+Entry shape: each gotcha is one ATX (`##`) heading with a clear
+fact statement up front, then *why* (mechanism / hardware
+constraint), then *apply* (fix template, alternatives, places
+this could bite again), then optionally a *diagnostic* (how to
+recognize the symptom). Faithful to the silent-bug symptom — name
+what the wrong output looks like so the next person can pattern-match
+quickly.
+
+Memory remains useful for *cross-conversation indices* (what was
+validated, what channel to use, current decision status) — but
+the **technical content** of a trap belongs in the repo.
+
 ## The two ops (why this split)
 
 A W4A4→W4A4 linear chain is two kernels, mirroring nunchaku's

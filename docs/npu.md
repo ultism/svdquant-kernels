@@ -85,3 +85,16 @@ same op needs to run on CUDA too, put it under `triton_kernels/<op>/`
 instead of writing AscendC. One `kernel.py` saves having to maintain
 parallel CuTe DSL + AscendC implementations. Compute-bound ops and
 NPU-only ops still belong here.
+
+## Gotchas (Ascend / PTO ISA traps)
+
+Silent-misbehavior traps on the 910B (a2a3) cube + vec mix-mode
+path — cube↔vec handoff is L2-resident not HBM, cube min
+addressable is 1 byte (no INT4 tile dtype), `TLoad` of ColMajor
+`[N, 1]` from GM only loads the head element, `TRowExpand`
+leaves the vec mask register contaminated, AIV K-loop reusing a
+partial UB region needs V→MTE2 cross-iter sync. Also the
+hardware-level reasoning behind "W4A4 cube uses raw `mad_s4`
+inside svdquant, not a PTO wrapper". See
+[gotchas/ascend.md](./gotchas/ascend.md). Add new entries there
+as you find them.

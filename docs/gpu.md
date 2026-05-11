@@ -64,3 +64,64 @@ tensor-core ridge) AND needs to also run on Ascend NPU, put it under
 `triton_kernels/<op>/` instead — one `kernel.py` runs on both
 backends (upstream Triton for CUDA, `triton-ascend` for NPU). See
 `../triton_kernels/README.md` for the library-choice rule.
+
+## Gotchas (CuTe DSL traps)
+
+Silent-misbehavior traps on the SM_100 / SM_103 CuTe DSL path —
+`const_expr` and `if`, divide-API nesting differences, 2-CTA
+`cluster_layout_vmnk` axes, 2-CTA `TiledCopy.partition_D`
+rest-mode trap, `num_acc_stage` vs `tile_n` interaction. See
+[gotchas/cute_dsl.md](./gotchas/cute_dsl.md). Add new entries
+there as you find them.
+
+## Perf-comparison context
+
+### nunchaku is hand-written PTX, not CuTe / CUDA C++
+
+nunchaku's NVFP4 / INT4 scaled-MMA mainloop uses inline `asm
+volatile` PTX (`tmp/nunchaku/src/kernels/zgemm/mma_earlycuda.cuh`),
+not `cute::gemm` or CUTLASS templates. Register packing, scale
+extraction, operand alignment are all manual. It's effectively a
+*tuned-for-generation reference* (GB202 / sm_120a era).
+
+When comparing against nunchaku numbers from our CuTe DSL kernels:
+
+- Don't expect apples-to-apples efficiency. The compiler gap is
+  real. The last 5-10 pp typically lives in register-allocation
+  and instruction-scheduling decisions the PTX author makes
+  explicitly but the DSL / MLIR lowering does generically.
+- Single-digit pp behind = competitive. 15+ pp behind = something
+  structural on our side, not just codegen.
+- bf16 vs fp16 asymmetry is typically larger on hand-PTX kernels
+  (different mma PTX ops, register banks, swizzle patterns) than
+  on DSL output, which goes through the same MLIR path with dtype
+  substitution.
+
+Does not apply to the Triton pod
+(`quantize_w4a4_act_fuse_lora`) — both sides go through Triton
+MLIR, so codegen gap is narrower; wins / losses are about kernel
+design, not PTX craft.
+
+### Blackwell NVFP4 routes to `hmma` subpipe in ncu, not a `qmma` subpipe
+
+NVFP4 scaled-MMA on gb100 / B200 (sm_100/103) is **UTCQMMA** at
+the SASS level, but ncu's metric tree puts it on the **hmma**
+subpipe. There is no standalone `qmma_*` counter — don't waste
+time searching by that name.
+
+Useful metrics (queried via `ncu --query-metrics --chips gb100`):
+
+- Pipe util:
+  `sm__pipe_tensor_subpipe_hmma_cycles_active.avg.pct_of_peak_sustained_active`
+  (covers HMMA + UTCHMMA + UTCQMMA + UTCOMMA all together).
+- FLOPs, FP32 accumulator (TMEM):
+  `sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp32`.
+- FLOPs, FP16 accumulator:
+  `sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp16`.
+- Separate FP4-only path (UTCOMMA, different from QMMA):
+  `sm__ops_path_tensor_op_utcomma_src_fp4_dst_fp32`.
+
+`--section ComputeWorkloadAnalysis` auto-pulls the subpipe
+breakdown — look for "Tensor" rows in SOL / CWA. UTCQMMA work
+shows up under "HMMA Pipe" in the SOL "Compute (SM) Pipe
+Utilization" panel.
