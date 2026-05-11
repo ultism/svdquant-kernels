@@ -34,35 +34,43 @@
 //
 // Reference: `tmp/nunchaku/src/kernels/zgemm/gemm_w4a4.cu:34-105`.
 //
-// Phase 3a signature: raw device pointers + opaque stream. The torch
+// Phase 3b signature: raw device pointers + opaque stream. The torch
 // op extension (`csrc/python/host/svdquant_w4a4_op.cpp`) calls this
 // directly with `at::Tensor.storage().data()` pointers and the current
 // NPU stream from `c10_npu::getCurrentNPUStream`. Tile size is still
-// constexpr-baked into the device kernel (M=128, K=2048, N=256, one
-// tile per launch); Phase 3b/3c add tile parameterization + LoRA /
-// bias / wcscales / next-layer quant args.
+// constexpr-baked into the device kernel (M=64, K=128, N=128, R=16,
+// one tile per launch); Phase 3c adds tile parameterization + bias /
+// wcscales / multi-tile.
+//
+// LoRA-up residual is computed on cube in a separate pass after the
+// main K-loop drains, then added to running_f32 on vec before final
+// fp16 cast. See `csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp`
+// for the cube/vec hand-off layout.
 
 namespace svdquant::ascend {
 
-// Phase 3a — INT4 cube + per-K-block dequant interface. Single-tile
-// (M=128, K=2048, N=256) hardcoded; multi-tile is 3b/3c work.
+// Phase 3b — INT4 main path + LoRA-up residual.
 //
-//   act:        [128, 1024]            uint8   2 signed INT4 / byte
-//   wgt:        [256, 1024]            uint8
-//   ascales:    [32, 128]              fp16    per-64-K-block act scale
-//   wscales:    [32, 256]              fp16    per-64-K-block wgt  scale
-//   workspace:  [kRingSlots, 128, 256] int32   cube/vec hand-off ring
-//   out:        [128, 256]             fp16    final dequantized output
-//   stream:     aclrtStream cast to void*.
+//   act:         [M, K/2]                uint8   2 signed INT4 / byte
+//   wgt:         [N, K/2]                uint8
+//   ascales:     [K/64, M]               fp16    per-64-K-block act scale
+//   wscales:     [K/64, N]               fp16    per-64-K-block wgt  scale
+//   lora_act_in: [M, R]                  fp32    = prev-op output, R ≤ 128
+//   lora_up:     [N, R]                  fp16
+//   workspace:   [kRingSlots, M, N]      int32   cube/vec hand-off ring
+//   lora_buf:    [M, N]                  fp32    LoRA-up cube → vec hand-off
+//   out:         [M, N]                  fp16    final dequantized output
+//   stream:      aclrtStream cast to void*.
 //
-// Caller (the torch op wrapper) allocates both `workspace` and `out`.
-// `workspace` lives in caching-allocated NPU memory and only persists
-// for the duration of the call — its contents are not user-visible.
-// Synchronization is the caller's responsibility; this launcher does
-// the H2D pack of the params struct + `aclrtlaunch_*` and returns.
+// Caller (the torch op wrapper) allocates `workspace`, `lora_buf`, and
+// `out`. Both `workspace` and `lora_buf` only persist for the duration
+// of the call — their contents are not user-visible. Synchronization
+// is the caller's responsibility; this launcher does the H2D pack of
+// the params struct + `aclrtlaunch_*` and returns.
 void gemm_w4a4(void* act, void* wgt,
                void* ascales, void* wscales,
-               void* workspace, void* out,
+               void* lora_act_in, void* lora_up,
+               void* workspace, void* lora_buf, void* out,
                void* stream);
 
 }  // namespace svdquant::ascend

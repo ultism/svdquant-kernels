@@ -81,6 +81,7 @@ enum GemmFftsFlag : uint16_t {
     HANDSHAKE_VEC_TO_CUBE = 1,
     CUBE_TILE_READY      = 2,
     VEC_TILE_CONSUMED    = 3,
+    LORA_BUF_READY       = 4,
 };
 
 // Mirrors host-side DeviceParams in kernel.cpp. ccec disallows casting
@@ -88,12 +89,15 @@ enum GemmFftsFlag : uint16_t {
 // these typed pointers from a host-packed struct on entry. Field
 // order MUST match the host-side struct exactly.
 struct DeviceParams {
-    __gm__ uint8_t* act;        // [128, 1024]  packed INT4
-    __gm__ uint8_t* wgt;        // [256, 1024]  packed INT4
-    __gm__ half*    ascales;    // [32, 128]    fp16 (K-block, M)
-    __gm__ half*    wscales;    // [32, 256]    fp16 (K-block, N)
-    __gm__ int32_t* workspace;  // [kRingSlots, 128, 256] int32 cube/vec ring
-    __gm__ half*    out;        // [128, 256]   fp16 final
+    __gm__ uint8_t* act;         // [M, K/2]              packed INT4
+    __gm__ uint8_t* wgt;         // [N, K/2]              packed INT4
+    __gm__ half*    ascales;     // [K/64, M]             fp16 (K-block, M)
+    __gm__ half*    wscales;     // [K/64, N]             fp16 (K-block, N)
+    __gm__ half*    la_fp16;     // [M, R]                fp16 (cast from fp32 host-side)
+    __gm__ half*    lu_T;        // [R, N]                fp16 (transposed host-side)
+    __gm__ int32_t* workspace;   // [kRingSlots, M, N]    int32 cube/vec ring
+    __gm__ float*   lora_buf;    // [M, N]                fp32 LoRA-up hand-off
+    __gm__ half*    out;         // [M, N]                fp16 final
 };
 
 // Tile shape constants — pinned for 3a single-tile. Starting smaller
@@ -107,6 +111,10 @@ constexpr uint32_t kBKPacked   = kBKLogical / 2;
 constexpr uint32_t kKSLogical  = 64;                   // mad_s4 K-block / scale block
 constexpr uint32_t kKSPacked   = kKSLogical / 2;       // 32 packed bytes
 constexpr uint32_t kNumKBlocks = kBKLogical / kKSLogical;  // 32
+
+// LoRA rank (production R ≤ 128). 32 is a real shipping point and keeps
+// the LoRA-up cube pass a single mad (kBM × kR × kBN fp16, fp32 acc).
+constexpr uint32_t kR          = 32;
 
 // Cube-vec ring. kPreloadNum = kRingSlots so cube fills the ring once
 // without back-pressure, then steady-state waits VEC_TILE_CONSUMED.
@@ -248,6 +256,79 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         for (uint32_t i = 0; i < kActualPreload; ++i) {
             wait_flag_dev(VEC_TILE_CONSUMED);
         }
+
+        // ===== LoRA-up cube pass =====
+        // Single fp16×fp16 mad: la_fp16 [M, R] × lu_T [R, N] → fp32 acc → lora_buf [M, N].
+        // L1 layout: place LA + LU_T after the main A/B occupancy. Main A occupies
+        // [0, M*K_packed) = [0, 4 KB); main B occupies [4 KB, 4 KB + K_packed*N) =
+        // [4 KB, 12 KB). LoRA LA goes at 16 KB (aligned), LU_T at 20 KB.
+        constexpr uint64_t kL1LAOffset  = 16u * 1024;
+        constexpr uint64_t kL1LUTOffset = kL1LAOffset + (uint64_t)kBM * kR * sizeof(half);
+
+        // Both tiles use ND2NZ (BLayout=ColMajor + SLayout=RowMajor) because
+        // the GM tensors for la_fp16 [M, R] and lu_T [R, N] are both row-major
+        // (Layout::ND). The DN2ZN path used by the main-GEMM B side requires a
+        // column-major-strided GM layout, which would force a host-side
+        // transpose of lora_up before it reaches this kernel — wasteful for a
+        // small rank-R hand-off.
+        using TileMatLA  = pto::Tile<pto::TileType::Mat, half, kBM, kR,
+                                      pto::BLayout::ColMajor, kBM, kR,
+                                      pto::SLayout::RowMajor, 512>;
+        using TileMatLUT = pto::Tile<pto::TileType::Mat, half, kR, kBN,
+                                      pto::BLayout::ColMajor, kR, kBN,
+                                      pto::SLayout::RowMajor, 512>;
+        using TileAccLora = pto::TileAcc<float, kBM, kBN, kBM, kBN>;
+        using LeftTileLora  = pto::TileLeft<half, kBM, kR, kBM, kR>;
+        using RightTileLora = pto::TileRight<half, kR, kBN, kR, kBN>;
+
+        using GlobalLA = pto::GlobalTensor<half,
+            pto::Shape<1, 1, 1, kBM, kR>,
+            pto::Stride<1, 1, 1, kR, 1>>;
+        using GlobalLUT = pto::GlobalTensor<half,
+            pto::Shape<1, 1, 1, kR, kBN>,
+            pto::Stride<1, 1, 1, kBN, 1>>;
+        using GlobalLoraBuf = pto::GlobalTensor<float,
+            pto::Shape<1, 1, 1, kBM, kBN>,
+            pto::Stride<1, 1, 1, kBN, 1>>;
+
+        TileMatLA   laMatTile;
+        TileMatLUT  lutMatTile;
+        TileAccLora loraAccTile;
+        TASSIGN(laMatTile,    kL1LAOffset);
+        TASSIGN(lutMatTile,   kL1LUTOffset);
+        TASSIGN(loraAccTile,  0u);  // reuse L0C BUF0 (main int32 acc is drained)
+
+        GlobalLA  laGlobal((__gm__ half*)p->la_fp16);
+        GlobalLUT lutGlobal((__gm__ half*)p->lu_T);
+
+        TLOAD(laMatTile, laGlobal);
+        TLOAD(lutMatTile, lutGlobal);
+
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
+
+        LeftTileLora  aLoraL0;
+        RightTileLora bLoraL0;
+        TASSIGN(aLoraL0, 0u);  // L0A BUF0
+        TASSIGN(bLoraL0, 0u);  // L0B BUF0
+
+        TEXTRACT(aLoraL0, laMatTile,  0, 0);
+        TEXTRACT(bLoraL0, lutMatTile, 0, 0);
+
+        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+
+        TMATMUL(loraAccTile, aLoraL0, bLoraL0);
+
+        set_flag(PIPE_M, PIPE_FIX, EVENT_ID2);
+        wait_flag(PIPE_M, PIPE_FIX, EVENT_ID2);
+
+        GlobalLoraBuf loraBufGm(p->lora_buf);
+        TSTORE(loraBufGm, loraAccTile);
+
+        // Signal vec that lora_buf is consumable.
+        ffts_cross_core_sync(PIPE_FIX,
+                              pto::getFFTSMsg(0x2, LORA_BUF_READY));
     }
 
     if ASCEND_IS_AIV {
@@ -369,17 +450,11 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         // existent prior TSTORE (drained at the end).
         set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
 
-        // 3a-fix-6: Cross-iter UB sync — partial_i32/f32 region (UB[0,
-        // 16KB)) is reused every iter. iter N's PIPE_V (TROWEXPANDMUL,
-        // TCOLEXPANDMUL, TMOV/TADD) writes partF32 there; iter N+1's
-        // PIPE_MTE2 TLOAD overwrites with new int32 partial. Without a
-        // V→MTE2 sync, MTE2 can fire before V drains, then V's stale
-        // fp32 writes land AFTER and corrupt the freshly-loaded int32
-        // bytes — TCVT then reads fp32 bit patterns as int32 (e.g.
-        // 0.1 = 0x3DCCCCCD = 1.036e9 → fp32 1e9). Diagnosed by
-        // 3a-bisect-3: debug_part1 max_abs ≈ 2^31 (= INT32_MAX) while
-        // ws[1] is in [-505, 474]. Seed satisfies iter 0; subsequent
-        // iters wait for prior iter's PIPE_V to drain.
+        // Cross-iter V→MTE2: partial_i32/f32 UB region is reused every
+        // iter; without this sync, iter N+1's TLOAD can race iter N's
+        // PIPE_V writes (TROWEXPANDMUL/TCOLEXPANDMUL/TMOV land after
+        // the load, corrupting the freshly-loaded int32 bytes). See
+        // docs/gotchas/ascend.md "AIV K-loop reusing partial UB".
         set_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
 
         for (uint32_t kb = 0; kb < kNumKBlocks; ++kb) {
@@ -439,51 +514,6 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             pto::TCVT(ascaleF32, ascaleF16, pto::RoundMode::CAST_RINT);
             pto::TCVT(wscaleF32, wscaleF16, pto::RoundMode::CAST_RINT);
 
-            // 3a-bisect-5a (post-cycle-16-fix): snapshot ascaleF32 [1, vecM]
-            // RowMajor tile into ws slot 6 (kb=0 only). Verifies the
-            // RowMajor TLOAD+TCVT loads all kVecM per-row ascale values
-            // correctly. AIV0 writes 32 fp32 at ws[6, 0, 0:32]; AIV1 at
-            // ws[6, 0, 32:64]. Previously this dump showed only [0,0]/[0,32]
-            // correct (ColMajor TLOAD bug); should now show all 64 correct.
-            if (kb == 0u) {
-                using GlobalAscaleDebug = pto::GlobalTensor<float,
-                    pto::Shape<1, 1, 1, 1, kVecM>,
-                    pto::Stride<1, 1, 1, kVecM, 1>>;
-                auto* ws_f32 = reinterpret_cast<__gm__ float*>(ws_gm);
-                GlobalAscaleDebug ascale_debug_gm(
-                    ws_f32 + 6u * kBM * kBN + row_off);
-
-                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-                TSTORE(ascale_debug_gm, ascaleF32);
-                set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
-                wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
-            }
-
-            // 3a-bisect-3: snapshot partF32 right after TCVT i32→f32 and
-            // before TROWEXPANDMUL into unused workspace slots 2/3 (slots
-            // 0/1 hold cube int32 partials). Reinterpret as fp32 so caller
-            // can compare against `workspace[0].float()` without touching
-            // DeviceParams. Drop after the in-place TCVT vs expandmul
-            // bisect resolves.
-            if (kb < 2u) {
-                using GlobalDebugF32 = pto::GlobalTensor<float,
-                    pto::Shape<1, 1, 1, kVecM, kBN>,
-                    pto::Stride<1, 1, 1, kBN, 1>>;
-                auto* ws_f32 = reinterpret_cast<__gm__ float*>(ws_gm);
-                const uint64_t debug_off =
-                    (uint64_t)(kb + 2) * kBM * kBN + (uint64_t)row_off * kBN;
-                GlobalDebugF32 debugGm(ws_f32 + debug_off);
-
-                // V → MTE3: TCVT must finish before TSTORE reads partF32
-                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-                TSTORE(debugGm, partF32);
-                // MTE3 → V: TSTORE must finish before TROWEXPANDMUL writes partF32
-                set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
-                wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
-            }
-
             // Expand ascaleF32 [1, vecM] RowMajor → ascaleBcast [vecM, 8]
             // RowMajor where row r = [s_r] × 8. PTO's TROWEXPAND internally
             // calls vbrcb on the [1, M] flat row (which is well-defined
@@ -508,53 +538,6 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
 
             // partF32[m,n] *= ascaleF32[m]  (via pre-broadcast ascaleBcast)
             pto::TROWEXPANDMUL(partF32, partF32, ascaleBcast);
-
-            // 3a-bisect-4: snapshot partF32 right after TROWEXPANDMUL and
-            // before TCOLEXPANDMUL into unused workspace slots 4/5
-            // (reinterpreted as fp32). Day 4 finding: out[0,:] EXACTLY
-            // matches ref[0,:] but out[1+,:] ≈ 0. Each AIV writes its own
-            // row band [row_off, row_off+kVecM); if TROWEXPANDMUL only
-            // applied row 0 of its [32, 128] tile, this dump shows
-            // ws[4][0,:] correctly = ws[0].float()[0,:] * ascale[0,0] but
-            // ws[4][1:32, :] either stale or = ws[0].float()[1:32, :]
-            // (unscaled).
-            if (kb < 2u) {
-                using GlobalDebug2F32 = pto::GlobalTensor<float,
-                    pto::Shape<1, 1, 1, kVecM, kBN>,
-                    pto::Stride<1, 1, 1, kBN, 1>>;
-                auto* ws_f32 = reinterpret_cast<__gm__ float*>(ws_gm);
-                const uint64_t debug2_off =
-                    (uint64_t)(kb + 4) * kBM * kBN + (uint64_t)row_off * kBN;
-                GlobalDebug2F32 debug2Gm(ws_f32 + debug2_off);
-
-                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-                TSTORE(debug2Gm, partF32);
-                set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
-                wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
-            }
-
-            // 3a-bisect-5b (post-cycle-16-fix): snapshot ascaleBcast tile
-            // (the manually-built [vecM, 8] RowMajor broadcast scale) into
-            // ws slot 7 (kb=0 only). After pto::TROWEXPAND, each row r
-            // should be [s_r] × 8. AIV0 writes rows 0..31, AIV1 rows
-            // 32..63. Previously this dumped the PTO-internal tmpbuf;
-            // now we dump our user-visible tile that TROWEXPANDMUL
-            // actually consumes.
-            if (kb == 0u) {
-                using GlobalAscaleBcastDebug = pto::GlobalTensor<float,
-                    pto::Shape<1, 1, 1, kVecM, kBcastCols>,
-                    pto::Stride<1, 1, 1, kBN, 1>>;
-                auto* ws_f32 = reinterpret_cast<__gm__ float*>(ws_gm);
-                GlobalAscaleBcastDebug bcast_debug_gm(
-                    ws_f32 + 7u * kBM * kBN + (uint64_t)row_off * kBN);
-
-                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-                TSTORE(bcast_debug_gm, ascaleBcast);
-                set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
-                wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
-            }
 
             // partF32[m,n] *= wscaleF32[n]
             pto::TCOLEXPANDMUL(partF32, partF32, wscaleF32);
@@ -583,9 +566,37 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         }
 
-        // Drain trailing seed before final cast+store.
+        // Drain trailing seed before LoRA-add + final cast+store.
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
+
+        // ===== LoRA-up residual: running += lora_buf[row_off:row_off+vecM, :] =====
+        // Reuse kPartialOff for the LoRA tile UB region — partial_i32/f32 is dead
+        // after the K-loop (last iter's TADD has finished into running). loraTile
+        // is also dead after the TADD below, so it cleanly aliases outF16's UB
+        // region for the final TCVT.
+        using TileLoraF32 = pto::Tile<pto::TileType::Vec, float, kVecM, kBN,
+                                      pto::BLayout::RowMajor, kVecM, kBN>;
+        using GlobalLoraSlice = pto::GlobalTensor<float,
+            pto::Shape<1, 1, 1, kVecM, kBN>,
+            pto::Stride<1, 1, 1, kBN, 1>>;
+
+        wait_flag_dev(LORA_BUF_READY);
+
+        TileLoraF32 loraTile;
+        TASSIGN(loraTile, kPartialOff);
+
+        const uint64_t lora_off = (uint64_t)row_off * kBN;
+        auto* lora_buf_gm = (__gm__ float*)p->lora_buf;
+        GlobalLoraSlice loraGm(lora_buf_gm + lora_off);
+        TLOAD(loraTile, loraGm);
+
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID3);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID3);
+
+        TileRunningF32 runningForAdd;
+        TASSIGN(runningForAdd, kRunningOff);
+        pto::TADD(runningForAdd, runningForAdd, loraTile);
 
         // Final epilogue: f32 → fp16 then TSTORE the AIV's row band.
         TileRunningF32 runningFinal;
