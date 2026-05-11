@@ -415,6 +415,29 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             pto::TCVT(ascaleF32, ascaleF16, pto::RoundMode::CAST_RINT);
             pto::TCVT(wscaleF32, wscaleF16, pto::RoundMode::CAST_RINT);
 
+            // 3a-bisect-5a: snapshot ascaleF32 [32, 1] ColMajor tile into
+            // ws slot 6 (kb=0 only). Verifies whether TLOAD+TCVT got all 32
+            // per-row ascale values correct. AIV0 writes 32 fp32 at offset
+            // row_off=0..31 inside ws[6] row 0; AIV1 writes at offset 32..63.
+            // Test reads ws[6, 0, 0:64] and compares against
+            // ascales[0, 0:64].float(). If mismatched → TLOAD/TCVT is the
+            // bug. If matched → bug is downstream (TROWEXPANDMUL/vbrcb).
+            if (kb == 0u) {
+                using GlobalAscaleDebug = pto::GlobalTensor<float,
+                    pto::Shape<1, 1, 1, kVecM, 1>,
+                    pto::Stride<1, 1, 1, 1, 1>,
+                    pto::Layout::DN>;
+                auto* ws_f32 = reinterpret_cast<__gm__ float*>(ws_gm);
+                GlobalAscaleDebug ascale_debug_gm(
+                    ws_f32 + 6u * kBM * kBN + row_off);
+
+                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+                TSTORE(ascale_debug_gm, ascaleF32);
+                set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+                wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+            }
+
             // 3a-bisect-3: snapshot partF32 right after TCVT i32→f32 and
             // before TROWEXPANDMUL into unused workspace slots 2/3 (slots
             // 0/1 hold cube int32 partials). Reinterpret as fp32 so caller
@@ -463,6 +486,34 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
                 set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
                 wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
                 TSTORE(debug2Gm, partF32);
+                set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+                wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+            }
+
+            // 3a-bisect-5b: snapshot vbrcb tmpbuf @ TMP_UB_OFFSET=184KB into
+            // ws slot 7 (kb=0 only). After TROWEXPANDMUL's internal vbrcb,
+            // tmpbuf should contain 32 blocks of 8 fp32 each, where block r
+            // = [s_r] × 8. View as [32, 8] RowMajor. AIV0 dumps to ws[7]
+            // rows 0..31, AIV1 to rows 32..63 (each AIV has its own UB
+            // tmpbuf so the dumps are independent). TCOLEXPANDMUL hasn't
+            // run yet, so tmpbuf still holds the row-broadcast values.
+            if (kb == 0u) {
+                using TileTmpbuf = pto::Tile<pto::TileType::Vec, float,
+                                              kVecM, 8,
+                                              pto::BLayout::RowMajor,
+                                              kVecM, 8>;
+                using GlobalTmpbufDebug = pto::GlobalTensor<float,
+                    pto::Shape<1, 1, 1, kVecM, 8>,
+                    pto::Stride<1, 1, 1, kBN, 1>>;
+                TileTmpbuf tmpbuf;
+                TASSIGN(tmpbuf, pto::TMP_UB_OFFSET);
+                auto* ws_f32 = reinterpret_cast<__gm__ float*>(ws_gm);
+                GlobalTmpbufDebug tmpbuf_debug_gm(
+                    ws_f32 + 7u * kBM * kBN + (uint64_t)row_off * kBN);
+
+                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+                TSTORE(tmpbuf_debug_gm, tmpbuf);
                 set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
                 wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
             }

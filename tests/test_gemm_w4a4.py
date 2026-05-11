@@ -227,6 +227,53 @@ class TestGemmW4A4Phase3aInt4(unittest.TestCase):
             f"mean_abs={d4_diff1.mean().item():.4f}"
         )
 
+        # ----- 3a-bisect-5a: ascaleF32 tile dump (post-TLOAD+TCVT) -----
+        # Kernel TSTORE'd ascaleF32 [32, 1] ColMajor into ws slot 6 (kb=0
+        # only). AIV0 writes at ws_f32[6, 0, 0:32], AIV1 at ws_f32[6, 0,
+        # 32:64]. Compare against ascales[0, 0:64].float(). If matches →
+        # TLOAD/TCVT correct, bug is downstream (in TROWEXPANDMUL itself,
+        # most likely vbrcb).
+        debug_ascale = ws_f32[6]                # [64, 128] fp32 view
+        ascale_flat = ascales_cpu[0]            # [M=64]
+        ascale_dumped = debug_ascale[0, :64]
+        ascale_diff = (ascale_dumped - ascale_flat).abs()
+        _step("  vec ascaleF32 dump (ws slot 6, kb=0)")
+        _step(f"  ascale_dumped[0:8] = {ascale_dumped[0:8].tolist()}")
+        _step(f"  ascale_ref   [0:8] = {ascale_flat[0:8].tolist()}")
+        _step(f"  ascale_dumped[24:32] = {ascale_dumped[24:32].tolist()}")
+        _step(f"  ascale_ref   [24:32] = {ascale_flat[24:32].tolist()}")
+        _step(f"  ascale_dumped[32:40] = {ascale_dumped[32:40].tolist()}  (AIV1's row 0..7)")
+        _step(f"  ascale_ref   [32:40] = {ascale_flat[32:40].tolist()}")
+        _step(
+            f"  ascale dump vs ref: max_abs={ascale_diff.max().item():.6f} "
+            f"mean_abs={ascale_diff.mean().item():.6f}"
+        )
+
+        # ----- 3a-bisect-5b: vbrcb tmpbuf dump (post-TROWEXPANDMUL) -----
+        # Kernel TSTORE'd tmpbuf @ TMP_UB_OFFSET as [32, 8] RowMajor into
+        # ws slot 7 (kb=0). After vbrcb, tmpbuf should hold:
+        #   block r (cols 0..7) = [s_r, s_r, ..., s_r]   ← 8 copies
+        # AIV0 writes ws[7][0..31, 0..7], AIV1 writes ws[7][32..63, 0..7].
+        # Verify: for r in [0, 32), tmpbuf[r, 0..7] should all equal
+        # ascale[0, r]. If yes → vbrcb works, bug is in vmul. If no →
+        # vbrcb is broken (row dispatch confused).
+        debug_tmpbuf = ws_f32[7]                # [64, 128] fp32 view
+        _step("  vec vbrcb tmpbuf dump (ws slot 7, kb=0, viewed as [32 blocks, 8 fp32])")
+        for r in [0, 1, 2, 5, 16, 24, 31]:
+            row = debug_tmpbuf[r, 0:8].tolist()
+            expected_s = ascale_flat[r].item()
+            _step(f"  tmpbuf[block {r}, :8] = {row}  (expected 8x {expected_s:.6f})")
+        # Check uniformity within each block
+        block_max = debug_tmpbuf[:32, 0:8].max(dim=1).values
+        block_min = debug_tmpbuf[:32, 0:8].min(dim=1).values
+        within_block_range = (block_max - block_min).abs()
+        _step(f"  within-block max-min: max={within_block_range.max().item():.6f} mean={within_block_range.mean().item():.6f}")
+        _step("    (should be 0 if vbrcb broadcasts each scalar into 8 contiguous fp32)")
+        # Check that block r's value = ascale[r]
+        block_vals = debug_tmpbuf[:32, 0]       # take first element of each block
+        block_diff = (block_vals - ascale_flat[0:32]).abs()
+        _step(f"  block[r, 0] vs ascale[r] for r in [0, 32): max_abs={block_diff.max().item():.6f} mean_abs={block_diff.mean().item():.6f}")
+
         _step("  comparing to ref")
         out_cpu = out.cpu()
         _step(f"  out [32,:8] = {out_cpu[32, :8].tolist()}  (AIV1's row 0)")

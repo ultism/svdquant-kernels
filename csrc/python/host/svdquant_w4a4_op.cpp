@@ -37,7 +37,7 @@ constexpr int64_t kPhase3aM         = 64;
 constexpr int64_t kPhase3aK         = 128;
 constexpr int64_t kPhase3aN         = 128;
 constexpr int64_t kPhase3aBlockSize = 64;        // K-block / mad_s4 KS
-constexpr int64_t kPhase3aRingSlots = 6;
+constexpr int64_t kPhase3aRingSlots = 8;  // 0/1 cube partials, 2/3 post-TCVT, 4/5 post-TROWEXPANDMUL, 6 ascaleF32, 7 vbrcb tmpbuf
 
 std::tuple<at::Tensor, at::Tensor>
 run_gemm_w4a4(const at::Tensor& act,
