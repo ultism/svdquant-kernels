@@ -495,6 +495,17 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             // entirely.
             pto::TROWEXPAND(ascaleBcast, ascaleF32);
 
+            // Defensive: TROWEXPAND's internal vbrcb may leave the mask
+            // register in a non-default state; TROWEXPANDMUL's RowMajor
+            // path's NormModeTail else-branch does NOT call SetContMask
+            // before vmul (it inherits the caller's mask). Cycle 16 Run H
+            // showed first 4 rows per AIV silently skipped — symptom
+            // consistent with stale mask. Reset to norm + full vec mask
+            // before TROWEXPANDMUL to make the mask state explicit.
+            pipe_barrier(PIPE_V);
+            set_mask_norm();
+            set_vector_mask(-1, -1);
+
             // partF32[m,n] *= ascaleF32[m]  (via pre-broadcast ascaleBcast)
             pto::TROWEXPANDMUL(partF32, partF32, ascaleBcast);
 
