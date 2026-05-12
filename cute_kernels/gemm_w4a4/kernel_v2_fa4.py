@@ -427,18 +427,20 @@ class Sm100GemmW4A4V2FA4:
         self.epi_tile_n = cute.size(self.epi_tile[1])
 
         # LoRA smem (LA + LU, single-buffer) deducted from budget so
-        # num_ab_stage shrinks. LA = [M, R] * dtype bytes, LU = [N, R] * dtype bytes.
+        # num_ab_stage shrinks. Both LA and LU are halved per-CTA under
+        # 2-CTA: LA via M-shard (cluster_shape_mn[0] == cta_group_size),
+        # LU via N-split inside the 2-CTA dense MMA atom's
+        # partition_shape_B (the same "2xSM MMA halves the B tile"
+        # mechanism CUTLASS uses for main B). Verified by probe (task
+        # #96, 2026-05-13): cosize(lu_one)=8192 elts vs handwritten
+        # tile_n*R, factor 0.500. Prior formula over-counted LU and
+        # silently blocked stage=3.
         lora_smem_bytes = 0
         if cutlass.const_expr(self.enable_lora):
-            # Per-CTA smem. LA is M-sharded across cluster CTAs (cluster_shape_mn[0]
-            # = cta_group_size), so LA per-CTA = full_LA // cta_group_size. LU is
-            # N-only, not M-sharded, full on each CTA. Prior formula used the
-            # cluster-level LA (over-counted 2× under 2-CTA) — worked because
-            # 1-stage had enough slack; C1's 2× multiplier made it overflow.
             la_bytes = (self.mma_inst_shape_mn[0] * self.R
                         * self.lora_ab_dtype.width // 8) // self.cta_group_size
             lu_bytes = (self.mma_inst_shape_mn[1] * self.R
-                        * self.lora_ab_dtype.width // 8)
+                        * self.lora_ab_dtype.width // 8) // self.cta_group_size
             lora_smem_bytes = (la_bytes + lu_bytes) * self.num_lora_stage
         # v2 wcscales / bias smem: each is [mma_tiler_n] c_dtype, single buffer.
         # Tile_n ∈ {128, 256}; at fp16 that's 256 B / 512 B — rounding error vs

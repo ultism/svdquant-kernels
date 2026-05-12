@@ -284,3 +284,64 @@ Reference anchors:
 - `cute_kernels/gemm_w4a4/kernel_v0_fa4.py:_pick_tiler_v0` —
   default kept at `(256, 128)`;
   `launch_v0(tiler_mn=(256, 256))` opt-in.
+
+
+---
+
+## `make_smem_layout_b(tiled_mma, ...)` halves the B tile under 2-CTA — handwritten `tile_n * R * dtype` is 2× too large
+
+The 2-CTA `tcgen05` dense MMA atom splits the B tile N-wise across
+the V partners inside `tiled_mma.partition_shape_B`. So the SMEM
+returned by `sm100_utils.make_smem_layout_b(tiled_mma_2cta, ...)`
+is per-CTA **half** of `tile_n * tile_k`, not the full tile —
+mirrors how A is M-split. Same for LoRA-MMA paths (LU) when the
+LoRA atom is built with `cta_group=TWO`.
+
+This is the "2xSM MMA halves the B tile" optimization called out
+in the Modular blog (`matmul-on-blackwell-part-3`, § "Shared
+Memory Optimization").
+
+**Why this is a silent trap.** Many kernels write a *handwritten*
+SMEM-budget estimate to feed `_compute_stages` rather than reading
+back `cute.cosize(b_smem_layout.outer)`. The handwritten formula
+naively writes `tile_n * R * dtype_bytes` for the B / LU tile. On
+1-CTA that is correct. On 2-CTA the real layout is half of that,
+and **the over-estimate inflates `lora_smem_bytes` (or
+`b_smem_bytes`) by exactly 2×**, which silently clamps
+`num_ab_stage` and looks like "we ran out of SMEM at higher
+LoRA-stage counts" when in reality there is room. No assert
+fires; numerics are still correct; perf is just lower than it
+should be and the SMEM-feasibility table you draw to plan
+optimizations is wrong on the LU row.
+
+**Diagnose.** Inject a print at the end of `_setup_attributes`:
+
+```python
+print("la_one =", cute.cosize(cute.slice_(self.la_smem_layout_staged,
+                                          (None, None, None, 0))))
+print("lu_one =", cute.cosize(cute.slice_(self.lu_smem_layout_staged,
+                                          (None, None, None, 0))))
+```
+
+Compare to the handwritten value. If the ratio is 0.5 on either
+operand, you have this bug. Real fix: drop the handwritten formula
+and read the cosize back, OR multiply the formula by
+`1 / cta_group_size` on the affected operand (M for A-style,
+N for B-style) when `cta_group == TWO`.
+
+**Apply.**
+
+- Anywhere you handwrite an SMEM-budget estimate for an operand
+  that comes from `make_smem_layout_{a,b}(tiled_mma_2cta, ...)`,
+  divide by `cta_group_size`. Both A *and* B are halved under
+  2-CTA, just along different axes (A: M, B: N).
+- Encountered in `kernel_v2_fa4.py::_setup_attributes` (LU), task
+  #96 (2026-05-13). Pre-fix, M=4352 K=3840 N=3072 R=128 ran at
+  566 TF / 4.2 % MFU; post-fix, 1532 TF / 15.3 % — same code,
+  same scheduler, just budget unclamped.
+
+Reference anchors:
+
+- `cute_kernels/gemm_w4a4/kernel_v2_fa4.py::_setup_attributes` —
+  `lora_smem_bytes` block with the comment citing this gotcha.
+- `docs/gpu.md` § "v2_fa4 LU SMEM accounting fix" — full data.

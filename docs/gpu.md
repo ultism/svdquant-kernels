@@ -216,25 +216,113 @@ each costs 64 KB but only ~26 KB of slack exists after c_stage=1.
 Naive stage=3 doubles LoRA SMEM (128 KB → 192 KB), which violates
 the "without doubling" constraint of task #58 anyway.
 
-### Paths to stage=3 within the budget
-
-- **Multicast LU (= task #59).** LU is identical across the two
-  cluster CTAs — both produce the same N range. Halving LU per CTA
-  (32 → 16 KB) drops per-stage LoRA to 48 KB, so stage=3 = 144 KB
-  ( +12.5 % vs current stage=2, *not* doubled) and leaves 83 KB for
-  ab+c+mbar → 2 ab_stages, fits. This makes #58 effectively
-  blocked-on-#59.
-- **Asymmetric LA=3 / LU=1.** Same 128 KB total LoRA SMEM as
-  current stage=2 (= satisfies the "no doubling" constraint
-  trivially), but the producer can only have 1 future tile's LU in
-  flight, so the prolog benefit on LU bandwidth is gone. Worth it
-  only if LA-side stall dominates.
-- **mma_inst_tile_k = 1 (shrink main ab to ~7 KB).** Frees enough
-  budget for stage=3 + 3 ab_stages, but quadruples main K-loop
-  sync (currently 4 instr per stage, would become 1). Likely a
-  net wash on main MMA; only worth measuring if multicast is
-  blocked.
+> **2026-05-13 follow-up: the LU row above is wrong by 2×.** The
+> handwritten `lu_bytes` formula treated LU as full N=128 per CTA,
+> but the 2-CTA dense MMA atom **halves LU via N-split** inside
+> `partition_shape_B` (same mechanism that halves main B). Real LU
+> per CTA = 16 KB / stage, not 32 KB. See the next section for the
+> probe, the fix, and the much larger win it unlocked. The
+> "paths to stage=3" list above is preserved for context, but is
+> now mooted — stage=3 became feasible with no code redesign, and
+> the bench in the next section shows it is also no longer the
+> right knob to tune.
 
 The probe artifact lives at `tmp/probe_smem_budget.py` and the
 inline `_compute_stages` print used to capture the numbers above
 was reverted in this commit.
+
+## v2_fa4 LU SMEM accounting fix (B200, 2026-05-13)
+
+The handwritten `lora_smem_bytes` in `_setup_attributes` over-counted
+LU by 2× — `_compute_stages` therefore reserved double the LoRA SMEM
+it needed, and `num_ab_stage` was clamped to 2 instead of 4 at the
+R=128 production shape. This was a single-line bug that *silently
+hid the real perf headroom* behind a misleading SMEM-budget message.
+
+### Probe (task #96)
+
+Injected `cute.cosize(slice_(lu_smem_layout_staged, ...))` into
+`_setup_attributes` so the actual per-stage byte count surfaces at
+trace time:
+
+```
+[PROBE96] num_lora_stage=2 cta_group_size=2
+[PROBE96] la_one cosize=16384 -> 32768 B (handwritten 32768 B, factor 1.000)
+[PROBE96] lu_one cosize=8192  -> 16384 B (handwritten 32768 B, factor 0.500)
+```
+
+LA matches (M-split was already correct in the handwritten formula).
+LU is half — confirms the Modular blog claim (Part 3, "2xSM MMA: Shared
+Memory Optimization") that the 2xSM atom halves the B tile via
+`partition_shape_B`. The fix is one extra `// self.cta_group_size`
+on the `lu_bytes` line; comment in
+`cute_kernels/gemm_w4a4/kernel_v2_fa4.py::_setup_attributes` cites
+this section.
+
+### Re-solved budget (R=128, fp16, 2-CTA, tile=(256, 128))
+
+| Component                            | Bytes  | KB  |
+|--------------------------------------|-------:|----:|
+| SMEM capacity (sm_100 == sm_103)     | 232448 | 227 |
+| `LA` per CTA (M-split)               |  32768 |  32 |
+| `LU` per CTA (**N-split, was 32**)   |  16384 |  16 |
+| per-stage LoRA = LA+LU               |  49152 |  48 |
+| `ab_bytes` per stage                 |  28672 |  28 |
+| `c_bytes_per` per epi stage          |   8192 |   8 |
+
+Feasibility per `num_lora_stage`:
+
+| stage | LoRA  | c stages chosen | ab stages chosen | fit? |
+|------:|------:|----------------:|-----------------:|:-----|
+|     2 |  96 K |               2 |            **4** | yes  |
+|     3 | 144 K |               3 |                2 | yes  |
+|     4 | 192 K |               1 |                1 | assert |
+
+The pre-fix code thought stage=2 had only 2 ab_stages of headroom and
+stage=3 didn't fit at all. Post-fix, stage=2 lands at ab=4 and stage=3
+becomes solvable too.
+
+### Wall-clock impact at stage=2 (the actual main path)
+
+Comparing the same `tmp/bench_gemm_v2_fa4_c1.py` shapes pre-fix
+(B300, doc'd) vs post-fix (B200, fresh run, fp16, 2-CTA):
+
+| M    | K     | N     | R   | pre-fix TF (B300) | post-fix TF (B200) | Δ          |
+|------|-------|-------|-----|------------------:|-------------------:|-----------:|
+|  256 |  3840 |  3072 | 128 |              35   |              **100** | +186%    |
+| 4352 |  3840 |  3072 | 128 |             566   |             **1532** | +171%    |
+| 4352 |  3840 | 15360 | 128 |            1881   |             **2720** | +45%     |
+| 4352 | 15360 |  3840 | 128 |            1864   |             **2733** | +47%     |
+| 4352 | 10240 |  3072 |  32 |            1530   |             **2623** | +71%     |
+
+(Numbers are absolute TF and so cross-card comparable; B300 has 1.35×
+more peak NVFP4 than B200, so a "same TF" reading would still mean we
+got faster against a weaker card. Logs:
+`log/verda_bench_lufix.log` (post-fix bench),
+`log/verda_smoke_lufix.log` (48/48 smoke pass at the new ab=4).)
+
+### Stage sweep — `num_lora_stage` is no longer the bottleneck
+
+Post-fix wall-clock sweep at M=4352 K=3840 N=3072 R=128 fp16 2-CTA
+(`tmp/bench_gemm_lora_stage_sweep.py`, 200 iter, CUDA-event timing):
+
+| stage | µs/launch | TFLOPS | (num_ab, num_lora, num_c) | vs stage=2 |
+|------:|----------:|-------:|--------------------------:|-----------:|
+|     0 |     51.82 |   1981 |                   (7, 0, 3) | −10.76 µs / −17.2 % |
+|     1 |     86.36 |   1189 |                   (5, 1, 4) | +23.78 µs / +38.0 % |
+| **2** | **62.58** | **1641** |               **(4, 2, 2)** | (baseline) |
+|     3 |     73.10 |   1405 |                   (2, 3, 3) | +10.52 µs / +16.8 % |
+
+Stage=3 is *feasible* but **slower**: the solver buys the extra LoRA
+prolog by giving up two main `num_ab` stages, and the main K-loop
+loses more than the LoRA prolog gains. This kills tasks #58 (deepen
+prolog) and #59 (multicast LoRA TMA) as wins — both were proposed
+under the false-assumption regime; the real ceiling now sits in main
+K-loop / TMEM occupancy, not LoRA-side latency hiding.
+
+LoRA overhead at the new baseline: 62.58 − 51.82 = 10.76 µs / +20.8 %
+on top of the LoRA-off path. That delta is what tasks #60 (overlap
+LoRA MMA with main K-loop epilogue tail) and future work would
+target, not LoRA prolog depth.
+
+Log: `log/verda_lora_stage_sweep.log`.
