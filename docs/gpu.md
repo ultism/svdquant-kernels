@@ -125,3 +125,45 @@ Useful metrics (queried via `ncu --query-metrics --chips gb100`):
 breakdown — look for "Tensor" rows in SOL / CWA. UTCQMMA work
 shows up under "HMMA Pipe" in the SOL "Compute (SM) Pipe
 Utilization" panel.
+
+## v2_fa4 baseline on B300 (Verda, 2026-05-12)
+
+First real-hardware run of `kernel_v2_fa4` after the C2 patch
+(`8f91240` — defer `pipeline_lora.consumer_wait` into the K-loop
+inject site). Host: 2× B300 SXM6 AC, sm_103, ncu unrestricted.
+
+Correctness: `tmp/smoke_gemm_v2_fa4.py` 48/48 pass across
+{fp16, bf16} × {1-CTA, 2-CTA} × {wcscales on/off} × {bias on/off}
+× R∈{32, 128}, fp16 rel ≤ 8e-4, bf16 rel ≤ 7e-3.
+
+Production-shape TFLOPS (`tmp/bench_gemm_v2_fa4_c1.py`, fp16, 2-CTA):
+
+| M    | K     | N     | R   | TFLOPS  | MFU / 13.5 PFLOPS |
+|------|-------|-------|-----|---------|-------------------|
+|  256 |  3840 |  3072 | 128 |    35   |    0.3%           |
+| 4352 |  3840 |  3072 | 128 |   566   |    4.2%           |
+| 4352 |  3840 | 15360 | 128 |  1881   |   13.9%           |
+| 4352 | 15360 |  3840 | 128 |  1864   |   13.8%           |
+| 4352 | 10240 |  3072 |  32 |  1530   |   11.3%           |
+
+(MFU normalized to a B300 NVFP4 dense peak of 13.5 PFLOPS, ~1.35×
+B200. The benched MFU printed by the script uses the B200 10 PFLOPS
+constant and overstates by 1.35×.)
+
+LoRA pipeline ladder (M=4352 K=3840 N=3072 R=128 fp16 2-CTA), via
+`tmp/profile_gemm_v2_fa4.py --num-lora-stage 0|1|2` under ncu
+SpeedOfLight:
+
+| Stage          | Duration | SM%  | Mem% | DRAM% | L2%  |
+|----------------|---------:|-----:|-----:|------:|-----:|
+| 0 LoRA off     |  44.6 µs | 53.5 | 42.7 |  4.7  | 33.3 |
+| 1 pre-C1       |  83.1 µs | 56.0 | 23.6 |  2.8  | 18.9 |
+| 2 C1 (+C2 on)  |  70.2 µs | 46.6 | 28.2 |  3.4  | 21.5 |
+
+C1 win (1-stage → 2-stage LoRA prolog): −12.9 µs / −15.6 %.
+Reports kept at `log/verda_ncu_v2_C2_stage{0,1,2}_4352_3840_3072_R128.ncu-rep`.
+
+C2 is enabled in all three stages above (it's a code change, not a
+runtime knob), so its isolated win is not yet captured. To measure:
+swap in pre-C2 `kernel_v2_fa4.py` (`git show 8f91240^:...`), rerun
+stage=2 ncu, diff Duration.
