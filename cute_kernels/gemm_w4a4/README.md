@@ -244,12 +244,14 @@ shared-tmem acc + C1 two-stage LoRA prolog):
   exploring next:
 
   - Increase LoRA prolog stage count beyond 2 (stage=3?) to deepen
-    the latency-hiding window without doubling smem again.
+    the latency-hiding window without doubling smem again — task #58
+    (blocked on #57 C2 ncu validation; same pipeline-stage axis).
   - Move LoRA TMA loads to the `multicast` cluster path so LA/LU
     bytes are shared across both CTAs (currently only A/B are
-    multicast in 2-CTA mode).
+    multicast in 2-CTA mode) — task #59.
   - Overlap LoRA MMA with the main K-loop's epilogue tail rather
-    than running it strictly before the main MMA exit.
+    than running it strictly before the main MMA exit — task #60
+    (most invasive; needs `num_acc_stage=2`, attempt last).
 
 ### Cross-arch reference — nunchaku `gemm_w4a4` on RTX PRO 6000 Blackwell
 

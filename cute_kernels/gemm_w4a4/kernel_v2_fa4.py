@@ -333,6 +333,8 @@ class Sm100GemmW4A4V2FA4:
             # for both main and LoRA atoms; serializing prolog TMA stalls
             # the issue queue under 2-CTA. Doubles LoRA smem (~+64KB/CTA
             # at R=128) — will shave ~1 stage off pipeline_aw.
+            # C2 attempt: stage=3 OOM-ed smem (lora 192 KB / 228 KB total
+            # leaves no room for main A/B); not viable without tile shrink.
             self.num_lora_stage = 2
         else:
             self.R_atoms = 0
@@ -1278,13 +1280,13 @@ class Sm100GemmW4A4V2FA4:
                         )
                     )
 
-                # LoRA prolog wait: block until load warp's LA/LU TMA
-                # commits. Only leader CTA issues MMAs, so only leader
-                # waits on the consumer side.
+                # C2: LoRA consumer_wait deferred to first LoRA atom
+                # inject site (gated by r_next == 0 inside kblock loop).
+                # Lets MMA warp issue main atom #0 while LA/LU TMA still
+                # arrives — buys ~1 main MMA of overlap on cold start.
+                # `tiled_mma_lora.set(ACCUMULATE)` is trace-time Python,
+                # safe outside; only the consumer_wait moves.
                 if cutlass.const_expr(self.enable_lora):
-                    if is_leader_cta:
-                        pipeline_lora.consumer_wait(lora_consumer_state)
-                    # LoRA MMA += into shared acc from the first atom.
                     tiled_mma_lora.set(tcgen05.Field.ACCUMULATE, True)
 
                 # `tiled_mma.set(ACCUMULATE, …)` is a trace-time Python
@@ -1347,6 +1349,15 @@ class Sm100GemmW4A4V2FA4:
                             # gemm += into the same tCtAcc cells (verified).
                             if cutlass.const_expr(self.enable_lora):
                                 if r_next < self.R_atoms and k_atom_flat == next_lora_at:
+                                    # C2: lazy consumer_wait — first LoRA
+                                    # atom of this tile blocks here, not at
+                                    # K-loop start. Lets main atom #0 fire
+                                    # while LA/LU TMA still arrives. Inside
+                                    # `is_leader_cta` guard at outer kblock
+                                    # loop (line ~1321), so leader-only.
+                                    if r_next == 0:
+                                        pipeline_lora.consumer_wait(
+                                            lora_consumer_state)
                                     # C1: stage dim now indexed by consumer state
                                     # (was hardcoded 0 when num_lora_stage=1).
                                     lora_kblock_coord = (
