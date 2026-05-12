@@ -68,9 +68,9 @@ mix-mode 1:2 + FFTS handshake + 6-slot ring + preload/main pipeline + PyTorch fp
 
 期间踩到的硅级坑(已固化到 `docs/gotchas/ascend.md`)：cube↔vec L2 handoff、cube 1-byte min addressable、`mad_s4` 路径选型、`TLoad ColMajor [N,1]` 只载 head、`TRowExpand` 污染 vec mask、AIV K-loop 跨 iter V→MTE2 sync。
 
-### Phase 3b — LoRA-up residual（代码完成，Space 端验证 pending）⏸
+### Phase 3b — LoRA-up residual（代码完成，Space 端数值 NaN，待调试）⏸
 
-完工 2026-05-12 本地;Space 端因 GitCode 910B 资源池"系统错误"暂无法上机验证。
+完工 2026-05-12 本地。Space e2e 在 commit `d349513` 上跑通了 link + launch + sync，但输出全 NaN。
 
 - ✅ op schema 扩展：`gemm_w4a4(act, wgt, ascales, wscales, lora_act_in, lora_up) -> Tensor`。R=32(production shipping point)。
 - ✅ host op：LA fp32→fp16 cast + LU [N, R]→[R, N] transpose。
@@ -80,9 +80,16 @@ mix-mode 1:2 + FFTS handshake + 6-slot ring + preload/main pipeline + PyTorch fp
 - ✅ 本地 x86 + aarch64 双 cross-build 绿。fixes 都已 land：
   - `7041864`: 重新 cross-build aarch64 .o(stale 7-arg 触发 undefined symbol)
   - `d437b31`: aarch64 `-fPIC`(R_AARCH64_ADR_PREL_PG_HI21 relink 失败)
-- ⏸ Space 端 e2e validation：GitCode 激活 3× "系统错误"，等下次 retry。
+  - `d349513`: test PHASE3B_R 16→32 对齐 op schema
+- ❌ Space 910B e2e 2026-05-12 cycle 1：`ref max_abs=3.666`，`out shape (64,128) fp16`，但 `diff max_abs=nan any_nan=True`。Phase 3a (lora=zeros) max_abs=0.0010 OK → 3b 一启 LoRA 立刻全 NaN，归因落在 LoRA-up 第二 pass 或 vec TADD region。任务 `#95 3b-6: debug LoRA-up NaN on 910B`。
 
-**已知风险**(下次 Space 验证时重点看)：TileMatLUT 用 ND2NZ 而不是 DN2ZN — 编译过但 TEXTRACT 到 TileRight 的语义是否正确没有验过。若数值偏差大，先怀疑这个;若数值 OK，3b 收工。
+**首选怀疑**：TileMatLUT 用 ND2NZ 而不是 DN2ZN — 编译过但 TEXTRACT 到 TileRight 的语义是否正确没验过(已在源码就标记 "layout 可疑")。其他候选：UB kPartialOff 在 LoRA TLOAD 时撞正在用的 fp32 running，lora_buf GM offset 错位，lora_up transpose 后 stride 错。
+
+**下次 Space 诊断顺序**（task #95）：
+1. AIC LoRA mad 后多 TSTORE 一份 lora_buf 到一个 side 输出 → 隔离 cube pass 和 vec TADD。
+2. AIV 把 lora_buf TLOAD 直接 TSTORE，不做 TADD → 看是 cube 出 NaN 还是 TADD 出 NaN。
+3. TileMatLUT 切 DN2ZN 重 cross-build 验一遍。
+4. 若仍 NaN，AIC 直接把 lora_buf 写 0(skip LoRA mad)，should 复现 Phase 3a 的 max_abs=0.0010。
 
 ### Phase 3c — Multi-tile + production shape + bias（pending）
 
@@ -101,4 +108,4 @@ mix-mode 1:2 + FFTS handshake + 6-slot ring + preload/main pipeline + PyTorch fp
 
 ## 当前位置
 
-Phase 3b 代码完成、Space 端 e2e 待验证。任务切换到 CUDA 路径(B200)。下次回到 NPU 路径时先 retry GitCode 激活，跑 `tests/test_gemm_w4a4.py`，若过则进 Phase 3c，若 fail 先看 TileMatLUT layout 选型。
+Phase 3b 代码完成、Space 端 e2e 跑通但输出 NaN。下一步是 task #95 的诊断阶梯(见 Phase 3b 末尾的"下次 Space 诊断顺序")。CUDA 路径(B200)同时进行中(task #57)。
