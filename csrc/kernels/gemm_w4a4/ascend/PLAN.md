@@ -49,41 +49,56 @@
 
 **当前状态**：编译/链接 + NPU 真机 launch 全绿。可以进 Phase 2。
 
-### Phase 2 — Cube/Vec 协作骨架（通信不死锁）
+### Phase 2 — Cube/Vec 协作骨架（通信不死锁）✅
 
 **目标**：cube 和 vec 都跑真 launch，FFTS 跨核同步可用，软流水跑得起来；算法是 mock，但通信图完整。
 
-- [ ] 把 FA 的 FFTS flag enum + `ffts_cross_core_sync` + `wait_flag_dev` pattern 搬进 `kernel_device.cpp`。
-- [ ] 加 `assign_running_acc_tile`、`assign_tile_buffers`、`allocate_cube_tile_buffers` / `allocate_vec_tile_buffers` helper（直接抄）。
-- [ ] cube 端 mock：跑 `pto_macro_matmul` 做 fp16 GEMM（不是 s4，便于先验证流水）；TSTORE 到 GM 环形 buffer（6 槽）。
-- [ ] vec 端 mock：拿 cube 输出 + 一个常量缩放，TROWEXPANDMUL + TADD 到 `runningOTile`，最后 TSTORE。
-- [ ] 加 preload loop + main loop 的双段结构（参考 `tfa_kernel.cpp:599-676`）。
-- [ ] 跟 PyTorch fp16 reference 对一遍数（mock 算法等价于一个简单 GEMM × 常量）；目标是验证通信，不求最终算法。
-- [ ] OpenI smoke：跑一组小 shape 不死锁，输出跟 reference 误差在 fp16 量级。
+完工 2026-05-10。所有子项验证通过(见 `phase2[a-f]_npu_smoke_validated.md`)：
+mix-mode 1:2 + FFTS handshake + 6-slot ring + preload/main pipeline + PyTorch fp16 reference + torch op extension (path C)。
 
-**完工标志**：cube 和 vec 都跑、6-slot 环形 buffer 工作、preload pipeline 不卡。
+### Phase 3a — INT4 main path（数值正确）✅
 
-### Phase 3 — 真算法上（数值正确）
+完工 2026-05-11。
 
-**目标**：替换 mock 为真 SVDQuant 算法，跟 `baseline/` PyTorch 参考过数。
+- ✅ 主 cube 路径：uint8_t Tile + 裸 `mad_s4`；K-loop 每 KS=64 nibble 一发，int32 → L0C → FIX-TSTORE → 6-slot ring。
+- ✅ vec per-K-block dequant：`TROWEXPANDMUL`(ascale) + `TCOLEXPANDMUL`(wscale)，fp32 累加到 `runningOTile`。
+- ✅ vec epilogue：cast fp32→fp16 → 主输出 TSTORE。
+- ✅ `baseline/kernels/gemm_w4a4/ref_int4.py` PyTorch reference。
+- ✅ 910B Space smoke：M=64 K=128 N=128 vs ref_int4 **max_abs=0.0010** (cycle 17, 2026-05-11)。
 
-- [ ] 主 cube 路径：`Tile<Mat, uint8_t, BM, BK/2>` + `TileLeft/TileRight<uint8_t, ...>` + 裸 `mad_s4(...)`；K-loop 每 KS=64 个 K nibble 一发，int32 累加在 L0C，结束后 FIX-pipe TSTORE 到 GM int32 ring。
-- [ ] vec 端 per-K-block dequant：拿 ascale[kb] × wscale[kb]（`TROWEXPANDMUL` 两次），fp32 累加到 `runningOTile`。模式跟 `pto_macro_fa_gu` 几乎一样，只是因子来源不同。
-- [ ] LoRA-up cube 阶段：`pto_macro_matmul` 跑 fp16/bf16 `lora_act_in @ lora_up`（fp32 acc），TSTORE 到第二条 GM ring。
-- [ ] vec epilogue：load LoRA-up 结果 + bias，加到 `runningOTile`，cast → 主输出 TSTORE。
-- [ ] 可选 next-layer quant 分支：跟 `triton_kernels/quantize_w4a4_act_fuse_lora` 的 quant 数学对齐，TSTORE qout / oscales（参考 `tquant/` ST 测例）。
-- [ ] `baseline/` 加 PyTorch reference（如果还没有）；smoke 比对所有 shape 误差 ≤ 适当 tolerance（int4 路径常见 1e-2 量级）。
-- [ ] Profile 一遍 cube/vec 占用率、L2 命中率（如果 cce profiler 能拿到），确认环形 buffer 槽数和 BM/BN 选型合理。
+期间踩到的硅级坑(已固化到 `docs/gotchas/ascend.md`)：cube↔vec L2 handoff、cube 1-byte min addressable、`mad_s4` 路径选型、`TLoad ColMajor [N,1]` 只载 head、`TRowExpand` 污染 vec mask、AIV K-loop 跨 iter V→MTE2 sync。
 
-**完工标志**：所有 production shape 数值通过 + 一份性能基线数据。
+### Phase 3b — LoRA-up residual（代码完成，Space 端验证 pending）⏸
+
+完工 2026-05-12 本地;Space 端因 GitCode 910B 资源池"系统错误"暂无法上机验证。
+
+- ✅ op schema 扩展：`gemm_w4a4(act, wgt, ascales, wscales, lora_act_in, lora_up) -> Tensor`。R=32(production shipping point)。
+- ✅ host op：LA fp32→fp16 cast + LU [N, R]→[R, N] transpose。
+- ✅ device cube LoRA-up 第二 pass：单 mad fp16×fp16→fp32 → GM lora_buf。新 FFTS flag `LORA_BUF_READY`。
+- ✅ device vec：`wait_flag_dev(LORA_BUF_READY)` → TLOAD lora_buf → TADD running → final TCVT/TSTORE。
+- ✅ test 解开 lora=zeros，换 seeded random(amp 0.1)。
+- ✅ 本地 x86 + aarch64 双 cross-build 绿。fixes 都已 land：
+  - `7041864`: 重新 cross-build aarch64 .o(stale 7-arg 触发 undefined symbol)
+  - `d437b31`: aarch64 `-fPIC`(R_AARCH64_ADR_PREL_PG_HI21 relink 失败)
+- ⏸ Space 端 e2e validation：GitCode 激活 3× "系统错误"，等下次 retry。
+
+**已知风险**(下次 Space 验证时重点看)：TileMatLUT 用 ND2NZ 而不是 DN2ZN — 编译过但 TEXTRACT 到 TileRight 的语义是否正确没有验过。若数值偏差大，先怀疑这个;若数值 OK，3b 收工。
+
+### Phase 3c — Multi-tile + production shape + bias（pending）
+
+- [ ] tile 参数化：把 kBM/kBN/kBKLogical/kR 从 constexpr 改成 launcher 传入。
+- [ ] 上 production shape (M=128 K=2048 N=256)。
+- [ ] bias、wcscales。
+- [ ] grid M-major launch，cores 共享 act 矩阵在 L2。
+- [ ] profile pass：cube/vec 占用率、L2 命中、ring 槽数调优。
 
 ## 不做（明确出 scope）
 
 - ❌ vLLM pipeline 侵入式 fusion（`fuse_glu` 等）—— `vllm_consumer_scope.md`
-- ❌ next-layer NVFP4 quant 集成到 CUDA 端 v3（已 drop）—— `gemm_w4a4_v3_scope_dropped.md`
+- ❌ next-layer NVFP4 quant 集成（v3 已 drop）—— `docs/architecture.md` § Scope decisions
 - ❌ 给 PTO 上游加 dtype-aware TLoad/TMov —— 是 SIG 的活，不在 svdquant 范畴
 - ❌ 把主 GEMM 和 LoRA-up 累加器在 L0C 上 fuse —— A2/A3 硬件层面做不到
 
 ## 当前位置
 
-Phase 1 起步 —— 准备拷 gemm_basic 编译骨架，接 svdquant 现有 `svdquant_add_kernel_pod` helper。
+Phase 3b 代码完成、Space 端 e2e 待验证。任务切换到 CUDA 路径(B200)。下次回到 NPU 路径时先 retry GitCode 激活，跑 `tests/test_gemm_w4a4.py`，若过则进 Phase 3c，若 fail 先看 TileMatLUT layout 选型。
