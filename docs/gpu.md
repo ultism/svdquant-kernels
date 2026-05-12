@@ -326,3 +326,44 @@ LoRA MMA with main K-loop epilogue tail) and future work would
 target, not LoRA prolog depth.
 
 Log: `log/verda_lora_stage_sweep.log`.
+
+### ncu A/B at the production shape (same B200, same launch config)
+
+Reports captured 2026-05-13 on the same Verda B200 instance: HEAD^
+(pre-LU-fix, `num_ab=2`) vs HEAD (`7296e90`, post-LU-fix, `num_ab=4`).
+Same shape, same launch flags, same `num_lora_stage=2`. The kernel was
+swapped on-disk between runs (the script ships with an EXIT trap to
+guarantee restore on failure — `tmp/verda_lufix_ncu_ab.sh`).
+
+| Metric                  | pre-LU-fix | post-LU-fix | Δ                  |
+|-------------------------|-----------:|------------:|-------------------:|
+| Duration                |  46.69 µs  |   32.13 µs  | **−14.56 µs / −31.2 %** |
+| Compute (SM) %          |  41.63     |   53.62     | **+11.99 pp**      |
+| Memory %                |  25.58     |   38.91     | +13.33 pp          |
+| L1/TEX Cache %          |  28.50     |   44.75     | +16.25 pp          |
+| L2 Cache %              |  24.57     |   36.18     | +11.61 pp          |
+| DRAM %                  |   5.04     |    7.31     | +2.27 pp           |
+| SM Active Cycles        |  72 433    |   46 126    | **−36.3 %**        |
+| Memory Throughput       |   386 GB/s |    561 GB/s | +45 %              |
+| Achieved Occupancy      |    8.55 %  |     8.66 %  | ≈                  |
+| Grid Size / Block Size  | 148 / 192  |  148 / 192  | identical          |
+
+Reads consistent with the budget story: same launch shape (148 ×
+192-thread blocks, ~8.6 % occupancy), 2× more `num_ab` stages keep the
+SM-side pipeline fed → SM% jumps +12 pp and SM Active Cycles drop 36 %.
+L1/TEX and L2 throughput both rise proportionally because the TMA
+producers now have more in-flight in-flight buffers to fill (it's not a
+"bandwidth saving" — it's the bandwidth being more *evenly used* across
+the kernel's wall-time). DRAM stays low (compute-bound regime
+preserved).
+
+The ncu single-launch Duration (32.13 µs) is lower than the bench-side
+CUDA-event average (62.58 µs / iter): the bench averages over a tight
+200-iter Python loop with `cute_dsl` launch overhead included; the ncu
+report measures just the device-side kernel. Both directions agree;
+treat the bench number as "kernel + launch tax" and the ncu number as
+"kernel only."
+
+Reports kept at
+`log/ncu_v2_{preLUfix,postLUfix}_4352_3840_3072_R128.ncu-rep` and the
+text excerpt at `log/verda_ncu_lufix_ab.log`.
