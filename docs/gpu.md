@@ -186,3 +186,55 @@ Reports: `log/verda_ncu_v2_{preC2,C2}_stage2_4352_3840_3072_R128.ncu-rep`.
 
 Reproduction script (uses an EXIT trap to guarantee the C2 file is
 restored even on ncu failure): `tmp/verda_c2_ab.sh`.
+
+## v2_fa4 SMEM budget at the production shape (B300, 2026-05-12)
+
+Probed on Verda via a `print` injected into `_compute_stages`. All
+numbers below are per-CTA, occupancy=1, tile=(256, 128, 64), R=128,
+fp16 ab/c, fp4 mma a/b, fp8 sf.
+
+| Component                            | Bytes  | KB  |
+|--------------------------------------|-------:|----:|
+| SMEM capacity (sm_100 == sm_103)     | 232448 | 227 |
+| `ab_bytes` per stage (A+B+SFA+SFB)   |  28672 |  28 |
+| `c_bytes_per` per epi stage          |   8192 |   8 |
+| `mbar_helpers`                       |   1024 |   1 |
+| `LA` per CTA (`tile_m*R/cta_group`)  |  32768 |  32 |
+| `LU` per CTA (`tile_n*R`)            |  32768 |  32 |
+| per-stage LoRA = LA+LU               |  65536 |  64 |
+
+Stage-by-stage feasibility on this shape:
+
+| num_lora_stage | LoRA  | c(2)  | ab budget | ab_stages | fit?  |
+|---------------:|------:|------:|----------:|----------:|:------|
+|             2  | 128 K | 16 K  |   82 K    |     2     | yes   |
+|             3  | 192 K | 16 K  |   18 K    |     0     | **assert** |
+|             3  | 192 K | 8 K (c=1) | 26 K  |    0     | still no |
+
+The headroom for a 3rd LoRA stage is one full LoRA stage short:
+each costs 64 KB but only ~26 KB of slack exists after c_stage=1.
+Naive stage=3 doubles LoRA SMEM (128 KB → 192 KB), which violates
+the "without doubling" constraint of task #58 anyway.
+
+### Paths to stage=3 within the budget
+
+- **Multicast LU (= task #59).** LU is identical across the two
+  cluster CTAs — both produce the same N range. Halving LU per CTA
+  (32 → 16 KB) drops per-stage LoRA to 48 KB, so stage=3 = 144 KB
+  ( +12.5 % vs current stage=2, *not* doubled) and leaves 83 KB for
+  ab+c+mbar → 2 ab_stages, fits. This makes #58 effectively
+  blocked-on-#59.
+- **Asymmetric LA=3 / LU=1.** Same 128 KB total LoRA SMEM as
+  current stage=2 (= satisfies the "no doubling" constraint
+  trivially), but the producer can only have 1 future tile's LU in
+  flight, so the prolog benefit on LU bandwidth is gone. Worth it
+  only if LA-side stall dominates.
+- **mma_inst_tile_k = 1 (shrink main ab to ~7 KB).** Frees enough
+  budget for stage=3 + 3 ab_stages, but quadruples main K-loop
+  sync (currently 4 instr per stage, would become 1). Likely a
+  net wash on main MMA; only worth measuring if multicast is
+  blocked.
+
+The probe artifact lives at `tmp/probe_smem_budget.py` and the
+inline `_compute_stages` print used to capture the numbers above
+was reverted in this commit.
