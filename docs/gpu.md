@@ -289,17 +289,70 @@ Comparing the same `tmp/bench_gemm_v2_fa4_c1.py` shapes pre-fix
 
 | M    | K     | N     | R   | pre-fix TF (B300) | post-fix TF (B200) | Δ          |
 |------|-------|-------|-----|------------------:|-------------------:|-----------:|
-|  256 |  3840 |  3072 | 128 |              35   |              **100** | +186%    |
-| 4352 |  3840 |  3072 | 128 |             566   |             **1532** | +171%    |
-| 4352 |  3840 | 15360 | 128 |            1881   |             **2720** | +45%     |
-| 4352 | 15360 |  3840 | 128 |            1864   |             **2733** | +47%     |
-| 4352 | 10240 |  3072 |  32 |            1530   |             **2623** | +71%     |
+|  256 |  3840 |  3072 | 128 |              35   |              **108** | +209 %   |
+| 4352 |  3840 |  3072 | 128 |             566   |             **1685** | +198 %   |
+| 4352 |  3840 | 15360 | 128 |            1881   |             **2648** | +41 %    |
+| 4352 | 15360 |  3840 | 128 |            1864   |             **2735** | +47 %    |
+| 4352 | 10240 |  3072 |  32 |            1530   |             **2645** | +73 %    |
 
 (Numbers are absolute TF and so cross-card comparable; B300 has 1.35×
 more peak NVFP4 than B200, so a "same TF" reading would still mean we
-got faster against a weaker card. Logs:
-`log/verda_bench_lufix.log` (post-fix bench),
-`log/verda_smoke_lufix.log` (48/48 smoke pass at the new ab=4).)
+got faster against a weaker card. Post-fix bench uses 20 warmup + 500
+timed iters (`bench_gemm_v2_fa4_c1.py`); a 3-warmup / 50-iter version
+under-counted the R=128 shape by ~10 % — see "Bench warmup gotcha"
+note below.)
+
+### MFU vs nunchaku (RTX PRO 6000 SM_120a, 4 PFLOPS peak)
+
+Post-fix MFU on B200 (10 PFLOPS NVFP4 peak) vs nunchaku reference
+numbers hardcoded in `tmp/bench_gemm_v2_fa4_c1.py:113-119`. nunchaku
+on RTX PRO 6000 is hand-written PTX (`tmp/nunchaku/src/kernels/zgemm/
+mma_earlycuda.cuh`), so any single-digit-pp gap is in the noise of
+"CuTe DSL MLIR codegen vs hand-rolled PTX" (see § "Perf-comparison
+context" above).
+
+| Shape (M, K, N, R)              | ours fp16 | nunchaku fp16 |  Δ pp | ours bf16 | nunchaku bf16 |  Δ pp |
+|---------------------------------|----------:|--------------:|------:|----------:|--------------:|------:|
+| 4352 × 3840  × 3072  × R=128    |  **16.9** |          16.2 |  +0.7 |      17.3 |          17.7 |  −0.4 |
+| 4352 × 3840  × 15360 × R=128    |  **26.5** |          19.5 |  +7.0 |  **26.7** |          24.7 |  +2.0 |
+| 4352 × 15360 × 3840  × R=128    |  **27.3** |          25.0 |  +2.3 |      27.3 |          30.5 |  −3.2 |
+| 4352 × 10240 × 3072  × R=32     |  **26.4** |          21.4 |  +5.0 |  **26.2** |          25.2 |  +1.0 |
+
+**fp16: 4/4 shapes ahead. bf16: 3/4 shapes ahead.** Remaining gap
+lives entirely in the bf16 column on the `M=4352 K=15360 N=3840`
+shape (−3.2 pp), which has nothing to do with LoRA — it's the
+"bf16 mma PTX path vs DSL MLIR lowering" asymmetry the perf-comparison
+section already calls out, and would not be moved by any LoRA-side
+optimization.
+
+Absolute throughput (since the two cards' peaks differ 2.5×):
+
+| Shape                           | ours TF (B200) | nunchaku TF (RTX PRO 6000) | ratio |
+|---------------------------------|---------------:|---------------------------:|------:|
+| 4352 × 3840  × 3072  × R=128    |           1685 |                       ~648 | 2.60× |
+| 4352 × 3840  × 15360 × R=128    |           2648 |                       ~780 | 3.40× |
+| 4352 × 15360 × 3840  × R=128    |           2735 |                      ~1000 | 2.74× |
+| 4352 × 10240 × 3072  × R=32     |           2645 |                       ~856 | 3.09× |
+
+### Bench warmup gotcha
+
+The first iteration of `kv2.launch_v2` on a fresh shape triggers the
+CuTe DSL JIT compile path (MLIR lowering → PTX → SASS). Subsequent
+iterations hit the compile cache. On B200 the first iter takes
+hundreds of milliseconds; iters 2–5 still see the SM-frequency ramp
+and one-shot allocator setup. Pre-2026-05-13 `bench_gemm_v2_fa4_c1.py`
+used `warmup=3, iters=50` and consistently under-counted the LoRA
+R=128 production shape by ~10 % (1532 TF reported, real 1685 TF —
+that's the "0.9 pp behind nunchaku → 0.7 pp ahead" delta we chased
+post-LU-fix). Now pinned at `warmup=20, iters=500`. If you see
+*another* round of "we got worse without changing anything", check
+the warmup count first.
+
+Logs:
+`log/verda_bench_lufix.log` (initial bench, undercounted),
+`log/verda_bench_lufix_warmup.log` (post-warmup-fix, current
+numbers), `log/verda_tiler_sweep.log` (tiler (256, 64/128/256)
+A/B that initially caught the variance).
 
 ### Stage sweep — `num_lora_stage` is no longer the bottleneck
 
