@@ -55,7 +55,7 @@ _step("  baseline ref_int4 loaded OK")
 PHASE3B_M = 64
 PHASE3B_K = 128
 PHASE3B_N = 128
-PHASE3B_R = 16     # LoRA rank (R ≤ 128 in production)
+PHASE3B_R = 32     # LoRA rank — must match kPhase3bR in svdquant_w4a4_op.cpp
 
 
 class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
