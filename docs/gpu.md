@@ -163,7 +163,26 @@ SpeedOfLight:
 C1 win (1-stage → 2-stage LoRA prolog): −12.9 µs / −15.6 %.
 Reports kept at `log/verda_ncu_v2_C2_stage{0,1,2}_4352_3840_3072_R128.ncu-rep`.
 
-C2 is enabled in all three stages above (it's a code change, not a
-runtime knob), so its isolated win is not yet captured. To measure:
-swap in pre-C2 `kernel_v2_fa4.py` (`git show 8f91240^:...`), rerun
-stage=2 ncu, diff Duration.
+### C2 standalone win (pre-C2 vs C2, both at stage=2)
+
+Swapped `kernel_v2_fa4.py` between `8f91240^` and `8f91240` while
+holding everything else constant, same shape and ncu flags:
+
+| Metric           | pre-C2  | C2      | Δ            |
+|------------------|--------:|--------:|-------------:|
+| Duration         | 71.17 µs | 70.18 µs | -0.99 µs / -1.4 % |
+| Compute (SM) %   | 45.00   | 46.55   | +1.55 pp     |
+| L2 Cache %       | 20.50   | 21.48   | +0.98 pp     |
+| Memory %         | 28.40   | 28.21   | ≈            |
+| DRAM %           |  3.31   |  3.35   | ≈            |
+| SM Active cycles | 63549   | 64068   | +0.8 %       |
+
+Story is clean: deferring `pipeline_lora.consumer_wait` lets the MMA
+warp start issuing main atom #0 ~1 µs before LA/LU TMA arrives. The
+saved cycles surface as +1.55 pp SM throughput. Memory side is
+unchanged — C2 is a scheduling change, not a bandwidth change.
+
+Reports: `log/verda_ncu_v2_{preC2,C2}_stage2_4352_3840_3072_R128.ncu-rep`.
+
+Reproduction script (uses an EXIT trap to guarantee the C2 file is
+restored even on ncu failure): `tmp/verda_c2_ab.sh`.
