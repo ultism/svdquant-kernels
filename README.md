@@ -13,38 +13,171 @@ the kernels stabilize; fusions that would require vLLM pipeline
 changes (e.g., folding a preceding GLU into a quantize op) are
 explicitly out of scope so the kernels stay drop-in.
 
+## Current performance
+
+### CUDA — `gemm_w4a4` on Blackwell B200 (NVFP4, 10 PFLOPS peak)
+
+`cute_kernels.gemm_w4a4.kernel_v2_fa4` (FA4-derived 3-warp persistent
+mainloop, 2-CTA, LoRA β-interleaved into the main K-loop) vs the
+nunchaku NVFP4 reference (RTX PRO 6000 Blackwell, SM_120a, 4 PFLOPS
+peak, hand-written inline PTX). MFU as a fraction of each card's
+dense-NVFP4 peak. Production shapes from `GEMM_SHAPES`.
+
+| Shape (M, K, N, R)              | ours fp16 | nunchaku fp16 | ours bf16 | nunchaku bf16 |
+| ------------------------------- | --------: | ------------: | --------: | ------------: |
+| 4352 × 3840  × 3072  × R=128    |  **16.9** |          16.2 |      17.3 |          17.7 |
+| 4352 × 3840  × 15360 × R=128    |  **26.5** |          19.5 |  **26.7** |          24.7 |
+| 4352 × 15360 × 3840  × R=128    |  **27.3** |          25.0 |      27.3 |          30.5 |
+| 4352 × 10240 × 3072  × R=32     |  **26.4** |          21.4 |  **26.2** |          25.2 |
+
+**fp16: 4/4 shapes ahead. bf16: 3/4 shapes ahead.** Only remaining
+gap is bf16-specific on the K=15360 shape (−3.2 pp) and tracks to
+the structural CuTe-DSL-MLIR-vs-hand-PTX bf16 asymmetry called out
+in `docs/gpu.md § Perf-comparison context`; not a LoRA-side issue.
+
+Honest local ceiling (same B200, same shapes, no LoRA / no
+epilogue / no next-quant — bare main NVFP4 MMA) from CUTLASS's
+`dense_blockscaled_gemm_persistent.py`:
+
+| Shape (M, K, N)         | CUTLASS 2-CTA 256×256 | ours 2-CTA v2_fa4 (fp16) |
+| ----------------------- | --------------------: | -----------------------: |
+| 4352 × 3840  × 3072     |   45.4 %              |   16.9 %                 |
+| 4352 × 3840  × 15360    |   58.4 %              |   26.5 %                 |
+| 4352 × 15360 × 3840     |   63.4 %              |   27.3 %                 |
+| 4352 × 10240 × 3072     |   60.7 %              |   26.4 %                 |
+
+CUTLASS doesn't carry LoRA / wcscales / bias, so the gap isn't
+apples-to-apples; it's the real "no-LoRA NVFP4 ceiling" on this
+chip. Closing it is task #60 territory (overlap LoRA MMA with main
+K-loop epilogue tail) and main-K-loop / TMEM occupancy work, **not**
+LoRA prolog depth — see `docs/gpu.md § Stage sweep` for why.
+
+Full numbers: `cute_kernels/gemm_w4a4/README.md`,
+`docs/gpu.md § MFU vs nunchaku`.
+
+### Ascend — `gemm_w4a4` on 910B (INT4 cube + fp16 LoRA)
+
+Phase 3a (INT4 main path, LoRA = 0) **passes**: 910B e2e via
+GitCode Space, M=64 K=128 N=128 vs PyTorch `ref_int4`
+**max_abs = 0.0010** (2026-05-11).
+
+Phase 3b (LoRA-up residual) **code complete, NaN debug**: kernel
+links, launches, syncs on 910B; output is fp16 with the correct
+shape but `diff vs ref = NaN`. Phase 3a numerics confirm cube +
+vec path; suspicion falls on `TileMatLUT` layout (ND2NZ vs
+DN2ZN) or `lora_buf` UB collision. Task #95 owns the ladder
+(`csrc/kernels/gemm_w4a4/ascend/PLAN.md § Phase 3b`).
+
+No 910B perf number yet — fix correctness first, profile after.
+
+## Algorithm — one W4A4 → W4A4 linear
+
+```mermaid
+flowchart LR
+    classDef hostOp fill:#fff5d6,stroke:#a06d00,color:#000;
+    classDef triton fill:#cfe9ff,stroke:#1f5fa6,color:#000;
+    classDef cute   fill:#d9f5d9,stroke:#1f7a1f,color:#000;
+    classDef ascend fill:#f5d9f0,stroke:#7a1f7a,color:#000;
+    classDef tensor fill:#eee,stroke:#555,color:#000,font-family:monospace;
+
+    X["fp16/bf16 input x"]:::tensor
+    LD["lora_down<br/>K x R fp16"]:::tensor
+    SM["smooth<br/>K fp16"]:::tensor
+    W["wgt<br/>packed NVFP4 or INT4"]:::tensor
+    LU["lora_up<br/>R x N fp16"]:::tensor
+
+    Q["quantize_w4a4_act_fuse_lora<br/>Triton • CUDA+Ascend"]:::triton
+    G["gemm_w4a4<br/>CuTe DSL on CUDA / AscendC on NPU"]:::cute
+
+    A["act<br/>M x K/2 packed"]:::tensor
+    AS["ascales<br/>K/16 x M fp8/fp16"]:::tensor
+    LAI["lora_act_in<br/>M x R fp32"]:::tensor
+    Y["fp16/bf16 output y"]:::tensor
+
+    X --> Q
+    LD --> Q
+    SM --> Q
+    Q --> A
+    Q --> AS
+    Q --> LAI
+
+    A --> G
+    AS --> G
+    W --> G
+    LU --> G
+    LAI --> G
+    G --> Y
+
+    subgraph one_W4A4_linear ["one W4A4 linear"]
+        Q
+        G
+    end
+```
+
+Math inside `gemm_w4a4`:
+
+```
+y_fp  = scaled_mma_nvfp4(act, wgt, ascales, wscales) · wcscale + bias    # main K-loop
+y_fp += lora_act_in @ lora_up                                            # β-interleaved
+y    = cast(y_fp, out_dtype)
+```
+
+The main NVFP4 / INT4 MMA and the LoRA fp16 MMA target the **same**
+TMEM accumulator (CUDA) / L0C tile (Ascend). On CUDA this is what the
+FA4-derived warp specialization buys us: one `mma` warp issues two
+MMA atoms into a shared acc, no chained S→P dependency. On Ascend the
+two passes are serialized through L0C with the LoRA pass written into
+a 6-slot L2-resident ring buffer the vec core then consumes.
+
+Format split is hardware-determined, not a user knob:
+
+| backend                     | values                | block scales       | MMA              |
+| --------------------------- | --------------------- | ------------------ | ---------------- |
+| CUDA SM_100 / SM_103        | NVFP4 (E2M1, 4 b)     | FP8-E4M3 per-16 K  | `tcgen05.mma.kind::mxf4nvf4.block_scale.scale_vec::4X` |
+| Ascend 910B (A2/A3 cube)    | signed INT4           | FP16 per-64 K      | raw `mad_s4`     |
+
+Blackwell `tcgen05` dropped scaled INT4 MMA; Ascend cube has no FP4
+support. Each side uses what its tensor unit actually speaks.
+
 ## Layout
 
 ```
 csrc/
   common/                  headers shared across backends (dtype, TensorRef, macros)
-  kernels/                 native pods — nvcc (CuTe DSL) or ccec (AscendC)
-    <op>/
-      include/<op>.h       op's public header (backend-agnostic signature)
-      cuda/kernel.cu       CUDA implementation
-      ascend/kernel.cpp    AscendC host launcher (device code added later)
+  kernels/                 native pods — currently AscendC only
+    gemm_w4a4/
+      include/gemm_w4a4.h  public header (backend-agnostic signature)
+      ascend/              host launcher + ccec __aicore__ device code
+      PLAN.md              Ascend bring-up plan, Phase 1 → 3c
       README.md
+cute_kernels/              CuTe DSL pods — Python @cute.jit, JIT-compiled at first call
+  gemm_w4a4/
+    kernel_v2_fa4.py       FA4-derived 3-warp persistent mainloop (shipping)
+    kernel_v0_fa4.py       no-LoRA reference (frozen)
+    kernel.py              monolithic v0, kept for trace cross-checks
+    README.md
 triton_kernels/            Triton pods — one source, runs on CUDA + Ascend
-  <op>/
+  quantize_w4a4_act_fuse_lora/
     kernel.py              @triton.jit + torch-tensor host wrapper
     README.md
 baseline/                  PyTorch reference implementations (numerical ground truth)
 tests/                     per-op numerical correctness tests
-benchmarks/                per-op micro-benchmarks
-docs/                      architecture.md, gpu.md, npu.md, per-kernel notes
+docs/                      architecture.md, gpu.md, npu.md, gotchas/, kernels/
 cmake/                     FindCANN.cmake, cuda_arch.cmake
-scripts/                   build.sh, env_ascend.sh
+scripts/                   build.sh (Ascend), env_ascend.sh, modal_app.py (B200), ship.sh (Space)
+pto-isa/                   vendored PTO ISA headers (Ascend cube/vec primitives)
+space/                     GitCode Space deploy bundle (link_smoke.sh, app.py)
 ```
 
 ## The two ops
 
-A W4A4→W4A4 linear chain is two kernels, mirroring nunchaku's public
+A W4A4 → W4A4 linear chain is two kernels, mirroring nunchaku's public
 C++ API:
 
-| Pod                                                      | Location               | Library   | Role |
-|----------------------------------------------------------|------------------------|-----------|------|
-| [`gemm_w4a4`](csrc/kernels/gemm_w4a4/)                   | `csrc/kernels/`        | CuTe DSL (CUDA) / AscendC (NPU) | Main W4A4 scaled-MMA + LoRA-up residual + bias + optional next-layer quantize |
-| [`quantize_w4a4_act_fuse_lora`](triton_kernels/quantize_w4a4_act_fuse_lora/) | `triton_kernels/`      | Triton    | Memory-bound preprocessing: NVFP4 quantize of input + `x @ lora_down` small GEMM |
+| Pod                                                                                | Location                | Library                          | Role |
+| ---------------------------------------------------------------------------------- | ----------------------- | -------------------------------- | ---- |
+| [`gemm_w4a4`](cute_kernels/gemm_w4a4/) (CUDA) / [Ascend](csrc/kernels/gemm_w4a4/)  | `cute_kernels/` + `csrc/kernels/` | CuTe DSL (CUDA) / AscendC (NPU) | Main W4A4 scaled-MMA + LoRA-up residual + bias |
+| [`quantize_w4a4_act_fuse_lora`](triton_kernels/quantize_w4a4_act_fuse_lora/)       | `triton_kernels/`       | Triton                           | Memory-bound preprocessing: NVFP4 (or INT4) quantize of input + `x @ lora_down` small GEMM |
 
 Library choice: compute-bound ops that need `tcgen05` / TMEM / 2-CTA
 go native per backend; memory-bound ops that need to run on both CUDA
@@ -56,25 +189,43 @@ as a pure-Python utility in `baseline/` — no kernel pod.
 ## Build
 
 ```
-# CUDA only
-CUDA=ON ASCEND=OFF ./scripts/build.sh
-
-# Ascend only
+# Ascend (cross-compile aarch64 .o for 910B; CMake covers AscendC pods + tests/bench)
 source scripts/env_ascend.sh
+./scripts/build.sh                  # both backends; CUDA branch is a placeholder
 CUDA=OFF ASCEND=ON ./scripts/build.sh
+```
 
-# Both (each autodetected; missing toolchain disables its backend with a warning)
-./scripts/build.sh
+The `CUDA=ON` CMake branch is reserved for any future native-C++ CUDA
+pod. All current CUDA work lives in `cute_kernels/` and JITs at first
+call through `cutlass-dsl` — there is **no** CUDA build step. Triton
+pods likewise JIT on demand. Pick a backend directly at call sites:
+
+```python
+from cute_kernels.gemm_w4a4.kernel_v2_fa4 import launch_v2          # CUDA
+from triton_kernels.quantize_w4a4_act_fuse_lora.kernel import launch # CUDA + Ascend
+```
+
+```cpp
+#include "kernels/gemm_w4a4/include/gemm_w4a4.h"
+svdquant::ascend::gemm_w4a4(params, stream);                         // Ascend
 ```
 
 See [`docs/architecture.md`](docs/architecture.md),
 [`docs/gpu.md`](docs/gpu.md), and [`docs/npu.md`](docs/npu.md) for
-per-backend details.
+per-backend details, and [`docs/gotchas/`](docs/gotchas/) for the
+hardware traps that bit us along the way.
 
 ## Status
 
-Scaffold. No kernels yet — every pod currently holds a host-side stub so
-the build is wired end-to-end before the first real kernel lands.
+- **Triton `quantize_w4a4_act_fuse_lora`** — shipping, passes
+  `tmp/smoke_fused.py`.
+- **CUDA `gemm_w4a4`** (`cute_kernels/gemm_w4a4/kernel_v2_fa4.py`) —
+  shipping on B200. fp16 ahead of nunchaku on 4/4 production shapes,
+  bf16 on 3/4. Remaining work targets the gap to CUTLASS NVFP4 dense
+  (no-LoRA) ceiling, not LoRA depth — see `docs/gpu.md § Stage sweep`.
+- **Ascend `gemm_w4a4`** (`csrc/kernels/gemm_w4a4/ascend/`) — Phase
+  3a (INT4 main path) passes 910B e2e; Phase 3b (LoRA-up residual)
+  output is NaN, debug ladder in `csrc/kernels/gemm_w4a4/ascend/PLAN.md`.
 
 ## License
 
