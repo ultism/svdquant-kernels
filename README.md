@@ -139,6 +139,76 @@ Format split is hardware-determined, not a user knob:
 Blackwell `tcgen05` dropped scaled INT4 MMA; Ascend cube has no FP4
 support. Each side uses what its tensor unit actually speaks.
 
+## `gemm_w4a4` v2_fa4 — 3-warp design (CUDA, shipping)
+
+`cute_kernels/gemm_w4a4/kernel_v2_fa4.py`. FA4-derived warp-specialized
+persistent mainloop; one `load` warp drives all TMAs, one `mma` warp
+issues both the main NVFP4 MMA and the LoRA fp16/bf16 MMA into the
+**same** TMEM accumulator, one `epilogue` warp does `× wcscale + bias`
+and the cast-and-store.
+
+```mermaid
+flowchart TB
+    classDef warp  fill:#d9f5d9,stroke:#1f7a1f,color:#000
+    classDef mem   fill:#cfe9ff,stroke:#1f5fa6,color:#000
+    classDef tcore fill:#f5d9f0,stroke:#7a1f7a,color:#000
+    classDef io    fill:#eeeeee,stroke:#555,color:#000
+
+    GIN["GMEM in<br/>act / ascales / wgt / wscales<br/>lora_act_in / lora_up"]:::io
+
+    subgraph LDW ["load warp"]
+        direction TB
+        L1["TMA aw bundle<br/>extra_tx_count, leader-CTA arrive_and_expect_tx"]:::warp
+        L2["TMA lora bundle"]:::warp
+    end
+
+    SAW(["SMEM aw ring<br/>num_ab=4, per-K-block"]):::mem
+    SL(["SMEM lora ring<br/>num_lora=2, per-tile"]):::mem
+
+    subgraph MMW ["mma warp"]
+        direction TB
+        M1["main MMA<br/>tcgen05.mma.kind::mxf4nvf4 scale_vec::4X<br/>cta_group=TWO"]:::tcore
+        M2["LoRA MMA<br/>tcgen05.mma fp16/bf16<br/>cta_group=TWO"]:::tcore
+    end
+
+    TMEM(["shared TMEM acc<br/>β-accum: main + LoRA"]):::mem
+
+    subgraph EPW ["epilogue warp"]
+        E1["× wcscale + bias<br/>cast → SMEM → TMA store"]:::warp
+    end
+
+    GOUT["GMEM out · y"]:::io
+
+    GIN --> L1
+    GIN --> L2
+    L1 -->|pipeline_aw| SAW
+    L2 -->|pipeline_lora| SL
+    SAW --> M1
+    SL --> M2
+    M1 -->|"β-accum (zero_init only first K-block)"| TMEM
+    M2 -->|β-accum, same tile| TMEM
+    TMEM -->|pipeline_acc| E1
+    E1 --> GOUT
+```
+
+### Features
+
+| # | Feature                                           | Where               | What it buys |
+|---|---------------------------------------------------|---------------------|--------------|
+| 1 | 2-CTA dense MMA (`cta_group=TWO`)                 | mma warp / cluster  | doubles per-tile FLOPs; A and B tiles halve per-CTA via `partition_shape_{A,B}` |
+| 2 | NVFP4 scaled MMA (`mxf4nvf4 scale_vec::4X`)       | main MMA            | what Blackwell tensor cores actually speak — 4-bit E2M1 values + FP8-E4M3 per-16-K block scales |
+| 3 | β-interleaved LoRA into **shared** TMEM acc       | mma warp            | LoRA fp16 MMA targets the same TMEM region as main NVFP4 MMA; no chained S→P dependency, no second acc dtype |
+| 4 | FA4 explicit per-warp `PipelineStateSimple`       | all 3 warps         | persistent iter doesn't deadlock at >20 tiles/CTA (the 500× hang of implicit `PipelineState`, commit `61905df`) |
+| 5 | `pipeline_aw` 3–4 stages, per-K-block             | load → mma          | overlaps next-K-block TMA with current MMA; `extra_tx_count` packs 4 TMAs into one barrier |
+| 6 | `pipeline_lora` 2 stages, per-tile (C1)           | load → mma          | amortizes LoRA prolog across main K-loop iters; +8 pp MFU on the R=128 production shape |
+| 7 | `StaticPersistentTileScheduler`                   | all warps           | grid clamped to `sm_count`; no per-tile launch overhead, `tile_idx += grid_dim()` advance |
+| 8 | Multicast cluster TMA (A/B only)                  | load warp           | A/B bytes shared across both CTAs in the cluster; LA/LU stay per-CTA after stage sweep showed multicast didn't pay |
+| 9 | LU SMEM **÷ cta_group_size** accounting fix       | budget solver       | the handwritten `lora_smem_bytes` over-counted LU 2× under 2-CTA; fix unlocks `num_ab=4` at `num_lora_stage=2`, +198 % TF on R=128 production |
+| 10| `× wcscale + bias` fused epilogue (v2)            | epilogue warp       | per-col affine inside the kernel; no second pass for channel-wise correction |
+
+Full prose and bring-up history: `cute_kernels/gemm_w4a4/README.md`.
+Hardware traps that bit us: `docs/gotchas/cute_dsl.md`.
+
 ## Layout
 
 ```
