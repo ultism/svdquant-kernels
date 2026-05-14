@@ -1,3 +1,8 @@
+---
+layout: default
+title: "Blackwell 上的 SVDQuant W4A4 算子实现 —— 基于 FA4 骨架的 warp 专用化、TMEM 与 2-CTA 持久化内核导览"
+---
+
 # Blackwell 上的 SVDQuant W4A4 算子实现 —— 基于 FA4 骨架的 warp 专用化、TMEM 与 2-CTA 持久化内核导览
 
 *如何让 Blackwell kernel 在复杂的流水线同步状态空间里不死锁 ——

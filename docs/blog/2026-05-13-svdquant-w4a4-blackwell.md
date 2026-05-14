@@ -1,3 +1,8 @@
+---
+layout: default
+title: "Implementing SVDQuant W4A4 on Blackwell — an FA4-skeleton, warp-specialized, TMEM, 2-CTA-persistent kernel walkthrough"
+---
+
 # Implementing SVDQuant W4A4 on Blackwell — an FA4-skeleton, warp-specialized, TMEM, 2-CTA-persistent kernel walkthrough
 
 *How to keep a complex pipeline-synchronization state space from

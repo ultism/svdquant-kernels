@@ -1,0 +1,26 @@
+title: SVDQuant W4A4 Kernels
+description: >-
+  Kernel development workbench for SVDQuant (W4A4 linear with low-rank
+  correction) on NVIDIA Blackwell and Huawei Ascend.
+theme: jekyll-theme-cayman
+
+# Render Markdown the way GitHub does (closer to the .md preview on the repo).
+markdown: kramdown
+kramdown:
+  input: GFM
+  hard_wrap: false
+  syntax_highlighter: rouge
+
+# Only ship the blog from /docs. Internal design / gotcha / per-kernel docs
+# stay readable on github.com but are not part of the published site.
+exclude:
+  - architecture.md
+  - gpu.md
+  - npu.md
+  - gotchas
+  - kernels
+  - blog/plan-2026-05-13-svdquant-w4a4-blackwell.md
+  - README.md
+  - Gemfile
+  - Gemfile.lock
+  - vendor
