@@ -26,6 +26,9 @@ tmp/*
 !tmp/.gitkeep
 log/*
 !log/.gitkeep
+.env
+.env.*
+!.env.example
 
 # gitcode-space branch only: ship cross-built aarch64 artifacts so the
 # Space container does only the final link step (slow ARM compile of

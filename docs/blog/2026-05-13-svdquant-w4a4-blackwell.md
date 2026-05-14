@@ -11,12 +11,7 @@ worth +198 % TF that was hiding behind a "runs fine" smoke.*
 
 ## 1. Preface
 
-| Shape (M, K, N, R)              | ours fp16 (B200) | nunchaku fp16 (PRO 6000) | ours bf16 | nunchaku bf16 |
-| ------------------------------- | ---------------: | -----------------------: | --------: | ------------: |
-| 4352 × 3840  × 3072  × R=128    |  **16.9**        |   16.2                   |   17.3    |   17.7        |
-| 4352 × 3840  × 15360 × R=128    |  **26.5**        |   19.5                   |  **26.7** |   24.7        |
-| 4352 × 15360 × 3840  × R=128    |  **27.3**        |   25.0                   |   27.3    |   30.5        |
-| 4352 × 10240 × 3072  × R=32     |  **26.4**        |   21.4                   |  **26.2** |   25.2        |
+![Per-shape MFU vs nunchaku — bold-teal cells mark where we lead](figures/preface_table_en.png)
 
 Numbers are MFU (fraction of each chip's dense-NVFP4 peak). **Mind
 the chips**: we run on B200 (SM_100, 10 PFLOPS dense FP4 peak);
@@ -194,24 +189,7 @@ Optimization" lever called out in the Modular
 it for A and B (`kernel_v2_fa4.py:465-468`). The LoRA path's LU
 operand was *meant* to use it too — that's §7.
 
-```
-        Cluster (2,1) under CtaGroup.TWO
-
-        ┌─────────────────────────────────────────────────────────┐
-        │           one shared (256 × 128) MMA tile               │
-        │   ┌─────────────────┬─────────────────────────────┐    │
-        │   │ A (128×K), V=0  │  B (128×K), N-shard, V=0     │    │
-   CTA0 │   │ rows  0–127     │  cols  0–63                  │    │
-        │   ├─────────────────┼─────────────────────────────┤    │
-        │   │ A (128×K), V=1  │  B (128×K), N-shard, V=1     │    │
-   CTA1 │   │ rows 128–255    │  cols 64–127                 │    │
-        │   └─────────────────┴─────────────────────────────┘    │
-        └─────────────────────────────────────────────────────────┘
-
-   A is M-split across V partners (`partition_shape_A`).
-   B is N-split across V partners (`partition_shape_B`).
-   Each CTA holds HALF the operand SMEM the 1-CTA atom would need.
-```
+![2-CTA cluster: A is M-split across V partners, B is N-split — each CTA holds half the operand SMEM](figures/cluster_sketch_en.png)
 
 ### 3.3 TMEM as an addressable accumulator space
 
@@ -478,40 +456,7 @@ hidden code path for reference numbers), and v2_fa4+C1 (= v1_fa4 +
 fix we'll get to in §7). The kernel that ships is v2_fa4 with C1, post
 LU SMEM fix; everything below describes that surface.
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                       v2_fa4, per CTA (192 threads)                    │
-│                                                                        │
-│   ┌────────────────┐    pipeline_aw   ┌─────────────────────────┐      │
-│   │   load warp    │ ───────────────▶ │       mma warp          │      │
-│   │   (warp 5)     │  (3–4 stages)    │       (warp 4)          │      │
-│   │                │                  │                         │      │
-│   │  TMA:          │    pipeline_lora │  main NVFP4 atom        │      │
-│   │  • A + B       │   ─────────────▶ │  + LoRA fp16/bf16 atom  │      │
-│   │  • SFA + SFB   │  (1–2 stages)    │  both → same TMEM acc   │      │
-│   │  • LA + LU     │                  │  (β-interleaved on K)   │      │
-│   │                │                  │                         │      │
-│   │ extra_tx_count │                  │                         │      │
-│   │ bundles act+   │                  │                         │      │
-│   │ wgt+sfa+sfb    │                  │                         │      │
-│   └────────────────┘                  └───────────┬─────────────┘      │
-│                                                   │                    │
-│                                       pipeline_acc │                   │
-│                                       (1 stage)    │                   │
-│                                                   ▼                    │
-│                                       ┌─────────────────────────┐      │
-│                                       │     epilogue warps      │      │
-│                                       │     (warps 0–3)         │      │
-│                                       │                         │      │
-│                                       │  TMEM → registers       │      │
-│                                       │  × wcscale + bias       │      │
-│                                       │  registers → SMEM → GMEM│      │
-│                                       └─────────────────────────┘      │
-│                                                                        │
-│   StaticPersistentTileScheduler around the whole thing.                │
-│   Pipeline state never resets at tile boundaries.                      │
-└────────────────────────────────────────────────────────────────────────┘
-```
+![v2_fa4 warp specialization: load → mma → epilogue, three pipelines never reset at tile boundaries](figures/warp_spec_en.png)
 
 ### 6.1 v0_fa4 — the scaffolding without LoRA
 
@@ -611,23 +556,7 @@ the K-loop. `stride = K_atoms // R_atoms` controls how often a LoRA
 atom fires; `r_next` and `next_lora_at` track which LoRA atom is up
 and when. Source at `kernel_v2_fa4.py:1309-1376`:
 
-```
-K-loop, one CTA, leader-CTA only (cluster MMAs propagate to follower):
-
-  main atoms:    M M M M M M M M M M M M M M M M ...
-                       │         │         │
-                       ▼         ▼         ▼
-  injected:            L         L         L         ← LoRA atoms,
-                                                       every `stride` mains
-
-  tcgen05 issue queue (per-CTA, in-order, depth 4–8):
-
-       ... ─▶ [ M_k-1 | M_k | L_r | M_k+1 | M_k+2 ] ─▶ ...
-
-       L_r reads tCtAcc cells M_k just wrote.
-       Both atoms ACCUMULATE = True after the very first main K-block.
-       Same TMEM region; no GMEM round-trip; no extra reduction pass.
-```
+![β-interleave: LoRA atoms sprinkled into the main K-loop hit the same TMEM region via the per-CTA in-order tcgen05 issue queue](figures/beta_interleave_en.png)
 
 The MLIR-tracing detail worth understanding: `tiled_mma.set(
 tcgen05.Field.ACCUMULATE, ...)` is a **Python trace-time mutation**.

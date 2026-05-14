@@ -9,12 +9,7 @@ smoke 背后、价值 +198 % TF 的 SMEM 账目 bug。*
 
 ## 1. 前言
 
-| Shape (M, K, N, R)              | 我们 fp16 (B200) | nunchaku fp16 (PRO 6000) | 我们 bf16 | nunchaku bf16 |
-| ------------------------------- | ---------------: | ----------------------: | --------: | ------------: |
-| 4352 × 3840  × 3072  × R=128    |  **16.9**        |   16.2                  |   17.3    |   17.7        |
-| 4352 × 3840  × 15360 × R=128    |  **26.5**        |   19.5                  |  **26.7** |   24.7        |
-| 4352 × 15360 × 3840  × R=128    |  **27.3**        |   25.0                  |   27.3    |   30.5        |
-| 4352 × 10240 × 3072  × R=32     |  **26.4**        |   21.4                  |  **26.2** |   25.2        |
+![各 shape 的逐 shape MFU vs nunchaku —— 加粗青色 cell 是我们领先的位置](figures/preface_table_zh.png)
 
 数字是 MFU（占该芯片 dense NVFP4 峰值的百分比）。**两边不是同代芯片**：
 我们在 B200（SM_100，dense FP4 峰值 10 PFLOPS）上跑；nunchaku 的 NVFP4
@@ -166,24 +161,7 @@ part-3` 那篇里说的 "2xSM MMA: Shared Memory Optimization"。CUTLASS 的
 用它（`kernel_v2_fa4.py:465-468`）。LoRA 路径里的 LU 算子**本来**也该
 用它 —— 那是 §7 的事。
 
-```
-        Cluster (2,1) 在 CtaGroup.TWO 下
-
-        ┌─────────────────────────────────────────────────────────┐
-        │           一个共享的 (256 × 128) MMA tile                │
-        │   ┌─────────────────┬─────────────────────────────┐    │
-        │   │ A (128×K), V=0  │  B (128×K), N-shard, V=0     │    │
-   CTA0 │   │ rows  0–127     │  cols  0–63                  │    │
-        │   ├─────────────────┼─────────────────────────────┤    │
-        │   │ A (128×K), V=1  │  B (128×K), N-shard, V=1     │    │
-   CTA1 │   │ rows 128–255    │  cols 64–127                 │    │
-        │   └─────────────────┴─────────────────────────────┘    │
-        └─────────────────────────────────────────────────────────┘
-
-   A 在 V 伙伴间按 M 切分（`partition_shape_A`）。
-   B 在 V 伙伴间按 N 切分（`partition_shape_B`）。
-   每 CTA 只持有 1-CTA atom 一半的 operand SMEM。
-```
+![2-CTA cluster：A 按 M 切、B 按 N 切，每 CTA 只持有一半的 operand SMEM](figures/cluster_sketch_zh.png)
 
 ### 3.3 TMEM —— 可寻址的累加器空间
 
@@ -407,40 +385,7 @@ warp 化**，把持久 tile loop 拎成内核最外层结构，把每个 Blackwe
 2-stage LoRA 前奏 + `× wcscale + bias` 融合 epilogue + §7 那条 LU SMEM
 fix）。出货是 LU 修复后的 v2_fa4+C1；下文描述的就是这个出货面。
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                       v2_fa4，每 CTA（192 线程）                       │
-│                                                                        │
-│   ┌────────────────┐   pipeline_aw    ┌─────────────────────────┐      │
-│   │   load warp    │ ───────────────▶ │       mma warp          │      │
-│   │   (warp 5)     │  (3–4 stage)     │       (warp 4)          │      │
-│   │                │                  │                         │      │
-│   │  TMA：         │   pipeline_lora  │  主 NVFP4 atom          │      │
-│   │  • A + B       │  ─────────────▶  │  + LoRA fp16/bf16 atom  │      │
-│   │  • SFA + SFB   │  (1–2 stage)     │  两条都写同一块 TMEM    │      │
-│   │  • LA + LU     │                  │  acc（沿 K 做 β 插入）  │      │
-│   │                │                  │                         │      │
-│   │ extra_tx_count │                  │                         │      │
-│   │ 把 act+wgt+    │                  │                         │      │
-│   │ sfa+sfb 打包   │                  │                         │      │
-│   └────────────────┘                  └───────────┬─────────────┘      │
-│                                                   │                    │
-│                                       pipeline_acc │                   │
-│                                       (1 stage)    │                   │
-│                                                   ▼                    │
-│                                       ┌─────────────────────────┐      │
-│                                       │     epilogue warps      │      │
-│                                       │     (warps 0–3)         │      │
-│                                       │                         │      │
-│                                       │  TMEM → 寄存器          │      │
-│                                       │  × wcscale + bias       │      │
-│                                       │  寄存器 → SMEM → GMEM   │      │
-│                                       └─────────────────────────┘      │
-│                                                                        │
-│   外层套 StaticPersistentTileScheduler。                               │
-│   pipeline 状态跨 tile 边界从不重置。                                  │
-└────────────────────────────────────────────────────────────────────────┘
-```
+![v2_fa4 warp 分工：load → mma → epilogue，三条 pipeline 跨 tile 边界从不重置](figures/warp_spec_zh.png)
 
 ### 6.1 v0_fa4 —— 不含 LoRA 的脚手架
 
@@ -529,23 +474,7 @@ interleave pattern 本身就是 K-loop 主 atom 每次多一个分支。
 `next_lora_at` 跟踪当前哪个 LoRA atom 上场、下次发在哪。源码在
 `kernel_v2_fa4.py:1309-1376`：
 
-```
-K-loop，一个 CTA，仅 leader CTA（cluster MMA 自动传给 follower）：
-
-  主 atom：      M M M M M M M M M M M M M M M M ...
-                       │         │         │
-                       ▼         ▼         ▼
-  插入：               L         L         L         ← LoRA atom，
-                                                       每 `stride` 个主 atom 一次
-
-  tcgen05 发射队列（每 CTA、顺序、深度 4–8）：
-
-       ... ─▶ [ M_k-1 | M_k | L_r | M_k+1 | M_k+2 ] ─▶ ...
-
-       L_r 读到的就是 M_k 刚写下的 tCtAcc cell。
-       两条 atom 在第一块主 K-block 之后都 ACCUMULATE = True。
-       同一块 TMEM 区；不绕 GMEM；不需要额外的 reduction pass。
-```
+![β-interleave：LoRA atom 撒进主 K-loop，靠每 CTA 顺序 tcgen05 发射队列打到同一块 TMEM 区](figures/beta_interleave_zh.png)
 
 值得理解的 MLIR trace 细节：`tiled_mma.set(tcgen05.Field.ACCUMULATE,
 ...)` 是 **Python trace 期对对象的修改**。每个 `cute.gemm` 调用点在
