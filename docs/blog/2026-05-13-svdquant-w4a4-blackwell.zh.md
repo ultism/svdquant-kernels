@@ -1,8 +1,8 @@
 # Blackwell 上的 SVDQuant W4A4 —— 一次对原语的实战导览
 
 *如何让 Blackwell kernel 在复杂的流水线同步状态空间里不死锁 ——
-借用 FlashAttention-4 的同步骨架（显式 per-warp 流水线状态
-+ warp 专用化 + 持久化 tile scheduler），而不是自己从头写一套
+借用 FlashAttention-4 的同步骨架（显式 per-warp 流水线状态 +
+warp 专用化 + 持久化 tile scheduler），而不是自己从头写一套
 状态机。以本仓库 `gemm_w4a4` 为例：从 1-CTA 的 CUTLASS 例程直译版
 重构成 FA4 衍生的 2-CTA 持久化内核，以及那一行藏在"看上去能跑"
 smoke 背后、价值 +198 % TF 的 SMEM 账目 bug。*
