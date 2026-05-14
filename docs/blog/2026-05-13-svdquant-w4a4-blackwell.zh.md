@@ -1,4 +1,4 @@
-# Blackwell 上的 SVDQuant W4A4 —— 一次对原语的实战导览
+# Blackwell 上的 SVDQuant W4A4 算子实现 —— 基于 FA4 骨架的 warp 专用化、TMEM 与 2-CTA 持久化内核导览
 
 *如何让 Blackwell kernel 在复杂的流水线同步状态空间里不死锁 ——
 借用 FlashAttention-4 的同步骨架（显式 per-warp 流水线状态 +
@@ -6,6 +6,10 @@ warp 专用化 + 持久化 tile scheduler），而不是自己从头写一套
 状态机。以本仓库 `gemm_w4a4` 为例：从 1-CTA 的 CUTLASS 例程直译版
 重构成 FA4 衍生的 2-CTA 持久化内核，以及那一行藏在"看上去能跑"
 smoke 背后、价值 +198 % TF 的 SMEM 账目 bug。*
+
+代码：[`ultism/svdquant-kernels`](https://github.com/ultism/svdquant-kernels)。
+这篇文章的大量细节都活在仓库源码里 —— 行号、PTX、内核 docstring、
+gotcha 文档 —— 建议配合仓库（以及一个能浏览仓库的 AI）一起读。
 
 ## 1. 前言
 

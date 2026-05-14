@@ -1,4 +1,4 @@
-# SVDQuant W4A4 on Blackwell — a tour through the primitives
+# Implementing SVDQuant W4A4 on Blackwell — an FA4-skeleton, warp-specialized, TMEM, 2-CTA-persistent kernel walkthrough
 
 *How to keep a complex pipeline-synchronization state space from
 deadlocking on Blackwell, by borrowing FlashAttention-4's
@@ -8,6 +8,11 @@ your own state machine. A walk-through on this repo's `gemm_w4a4`
 kernel — re-architected from a 1-CTA stock CUTLASS port to a 2-CTA
 persistent FA4-derived kernel — and the one-line SMEM-accounting bug
 worth +198 % TF that was hiding behind a "runs fine" smoke.*
+
+Code: [`ultism/svdquant-kernels`](https://github.com/ultism/svdquant-kernels).
+A lot of this post's substance lives in the repo source — line numbers,
+PTX, kernel docstrings, gotcha docs — best read alongside the repo
+(and an AI that can navigate it).
 
 ## 1. Preface
 
