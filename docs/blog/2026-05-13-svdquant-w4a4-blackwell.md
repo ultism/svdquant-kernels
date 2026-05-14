@@ -9,23 +9,27 @@ kernel — re-architected from a 1-CTA stock CUTLASS port to a 2-CTA
 persistent FA4-derived kernel — and the one-line SMEM-accounting bug
 worth +198 % TF that was hiding behind a "runs fine" smoke.*
 
-## 1. tl;dr
+## 1. Preface
 
-**Headline numbers.** On B200 (SM_100, NVFP4, 10 PFLOPS dense peak),
-this kernel reaches 16.9 %–27.3 % MFU on production shapes —
-single-digit-pp of nunchaku's hand-rolled inline PTX kernel on
-*its* target chip (RTX PRO 6000, SM_120a, 4 PFLOPS peak; fp16 ahead
-on 4/4, bf16 ahead on 2/4 plus one near-tie and one 3.2-pp-behind
-shape). **Read this number carefully**: nunchaku's NVFP4 is gated
-on `__CUDA_ARCH__ >= 1200`, doesn't ship an SM_100 binary, so the
-comparison is *cross-chip* across two Blackwell generations with
-different tensor-core ISAs and toolchains. It's an
-implementation-quality reference point — "what does mature hand-PTX
-achieve on its target chip" — **not** a verdict on whose code is
-better written. The honest local ceiling (same B200, same shapes,
-no LoRA / no affine — CUTLASS's `dense_blockscaled_gemm_persistent.py`
-at 2-CTA 256×256) sits at 45–63 % MFU; that is the headroom that
-still matters.
+| Shape (M, K, N, R)              | ours fp16 (B200) | nunchaku fp16 (PRO 6000) | ours bf16 | nunchaku bf16 |
+| ------------------------------- | ---------------: | -----------------------: | --------: | ------------: |
+| 4352 × 3840  × 3072  × R=128    |  **16.9**        |   16.2                   |   17.3    |   17.7        |
+| 4352 × 3840  × 15360 × R=128    |  **26.5**        |   19.5                   |  **26.7** |   24.7        |
+| 4352 × 15360 × 3840  × R=128    |  **27.3**        |   25.0                   |   27.3    |   30.5        |
+| 4352 × 10240 × 3072  × R=32     |  **26.4**        |   21.4                   |  **26.2** |   25.2        |
+
+Numbers are MFU (fraction of each chip's dense-NVFP4 peak). **Mind
+the chips**: we run on B200 (SM_100, 10 PFLOPS dense FP4 peak);
+nunchaku's NVFP4 is gated on `__CUDA_ARCH__ >= 1200` and ships only
+SM_120a/121a binaries, so we run it on RTX PRO 6000 (4 PFLOPS peak)
+— two tensor-core ISAs, two toolchains, two generations of Blackwell.
+MFU normalizes for each chip's peak, but **this table is not a
+verdict on whose code is better written** — it is an
+implementation-quality reference ("how fast does mature hand-rolled
+inline PTX go on its own target chip"). Same B200, no LoRA or
+affine, CUTLASS's `dense_blockscaled_gemm_persistent.py` at 2-CTA
+256×256 lands at 45–63 % MFU. *That* is the headroom that still
+matters.
 
 The op is the compute-bound half of SVDQuant: NVFP4 scaled MMA + a
 small low-rank LoRA residual + a per-column affine. The math fits on
