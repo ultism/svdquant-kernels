@@ -9,6 +9,19 @@ smoke 背后、价值 +198 % TF 的 SMEM 账目 bug。*
 
 ## 1. 一句话总结
 
+**先说数字**。在 B200（SM_100、NVFP4、dense 峰值 10 PFLOPS）上，这个
+内核在生产 shape 上跑到 16.9 %–27.3 % MFU —— 在可比的 shape 上和
+nunchaku 那条手写 inline PTX 的内核（跑在它自己的目标芯片 RTX PRO 6000，
+SM_120a、4 PFLOPS）比，**fp16** 全数 4/4 领先，**bf16** 2/4 领先、1/4
+在 ±0.5 pp 噪声内、1/4 还落后 3.2 pp。**这个数字要小心读**：nunchaku 的
+NVFP4 在 `__CUDA_ARCH__ >= 1200` 上 gated，根本没有 SM_100 的二进制，
+所以这是一组**跨芯片、跨代**的比较 —— 两套 Blackwell 代际、两套 tensor
+core ISA、两条工具链各跑各的。它能告诉你"成熟手写 PTX 在它自己的目标
+芯片上能跑多快"，但**不能**用它来判断哪一边代码"写得好"。同一台
+B200、同一组 shape、剥掉 LoRA 和仿射 —— 用 CUTLASS 的
+`dense_blockscaled_gemm_persistent.py` 在 2-CTA 256×256 上跑出来的本地
+天花板是 45 %–63 % MFU；那才是还真值得追的剩余空间。
+
 这个算子是 SVDQuant 里 compute-bound 的那一半：NVFP4 scaled-MMA + 小规模
 的低秩 LoRA 残差 + 按列仿射。数学一行写得下；实现几乎用尽了 SM_100 /
 SM_103 比上一代多出来的全部原语。
@@ -18,9 +31,7 @@ SM_103 比上一代多出来的全部原语。
 上卡在 ~27 % MFU；想把它升到 2-CTA 走 `cta_group=TWO` 的第一阶段尝试
 得到的基本是零增益（28 % vs 27 %）。**v2_fa4**
 （`cute_kernels/gemm_w4a4/kernel_v2_fa4.py`，FA4 衍生的 warp 专用化、
-三 pipeline、2-CTA 持久化）是出货面 —— 在生产 shape 上拿到 16.9 %–27.3 %
-MFU；在可比的 shape 上 fp16 全数 4/4 领先 nunchaku，bf16 上 2/4 领先、
-1/4 在噪声内（−0.4 pp）、1/4 还落后 3.2 pp。
+三 pipeline、2-CTA 持久化）是出货面，跑出上面那组数字的就是它。
 
 整个项目里单行改动 ROI 最高的一处：把 2-CTA 模式下每个 CTA 对
 LoRA-up 权重块的 SMEM 字节数估算减半。kernel 在 trace time 解一道

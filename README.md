@@ -30,10 +30,24 @@ dense-NVFP4 peak. Production shapes from `GEMM_SHAPES`.
 | 4352 × 15360 × 3840  × R=128    |  **27.3** |          25.0 |      27.3 |          30.5 |
 | 4352 × 10240 × 3072  × R=32     |  **26.4** |          21.4 |  **26.2** |          25.2 |
 
-**fp16: 4/4 shapes ahead. bf16: 3/4 shapes ahead.** Only remaining
-gap is bf16-specific on the K=15360 shape (−3.2 pp) and tracks to
-the structural CuTe-DSL-MLIR-vs-hand-PTX bf16 asymmetry called out
-in `docs/gpu.md § Perf-comparison context`; not a LoRA-side issue.
+**fp16: 4/4 shapes ahead. bf16: 2/4 ahead, 1/4 within ±0.5 pp noise,
+1/4 still 3.2 pp behind** on the K=15360 shape. That −3.2 pp gap
+tracks to the structural CuTe-DSL-MLIR-vs-hand-PTX bf16 asymmetry
+called out in `docs/gpu.md § Perf-comparison context`; not a
+LoRA-side issue.
+
+**This is not an apples-to-apples comparison and not a code-quality
+verdict.** nunchaku's NVFP4 is hand-rolled inline PTX
+(`mma_earlycuda.cuh`) and is gated on `__CUDA_ARCH__ >= 1200` —
+SM_120a/121a (consumer/workstation Blackwell). There is no SM_100
+binary, so we can't run it on B200 at all. The table is therefore
+*cross-chip*: ours on B200 (data-center Blackwell, 10 PFLOPS dense
+NVFP4 peak) vs nunchaku on RTX PRO 6000 (4 PFLOPS peak), with the
+tensor-core ISA and toolchain differing on both sides. MFU
+normalizes for each card's peak, but the comparison is an
+*implementation-quality reference* ("what does a mature hand-PTX
+W4A4 NVFP4 kernel achieve on its target chip"), **not** a measure
+of whose code is "better written".
 
 Honest local ceiling (same B200, same shapes, no LoRA / no
 epilogue / no next-quant — bare main NVFP4 MMA) from CUTLASS's

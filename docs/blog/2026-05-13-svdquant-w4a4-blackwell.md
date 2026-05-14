@@ -11,6 +11,22 @@ worth +198 % TF that was hiding behind a "runs fine" smoke.*
 
 ## 1. tl;dr
 
+**Headline numbers.** On B200 (SM_100, NVFP4, 10 PFLOPS dense peak),
+this kernel reaches 16.9 %–27.3 % MFU on production shapes —
+single-digit-pp of nunchaku's hand-rolled inline PTX kernel on
+*its* target chip (RTX PRO 6000, SM_120a, 4 PFLOPS peak; fp16 ahead
+on 4/4, bf16 ahead on 2/4 plus one near-tie and one 3.2-pp-behind
+shape). **Read this number carefully**: nunchaku's NVFP4 is gated
+on `__CUDA_ARCH__ >= 1200`, doesn't ship an SM_100 binary, so the
+comparison is *cross-chip* across two Blackwell generations with
+different tensor-core ISAs and toolchains. It's an
+implementation-quality reference point — "what does mature hand-PTX
+achieve on its target chip" — **not** a verdict on whose code is
+better written. The honest local ceiling (same B200, same shapes,
+no LoRA / no affine — CUTLASS's `dense_blockscaled_gemm_persistent.py`
+at 2-CTA 256×256) sits at 45–63 % MFU; that is the headroom that
+still matters.
+
 The op is the compute-bound half of SVDQuant: NVFP4 scaled MMA + a
 small low-rank LoRA residual + a per-column affine. The math fits on
 one line; the implementation exercises essentially every primitive
@@ -22,10 +38,8 @@ stock `cutlass.pipeline.PipelineState`) caps at ~27 % MFU on the
 production shape; the Phase-1 attempt to lift it to 2-CTA via
 `cta_group=TWO` got essentially zero benefit (28 % vs 27 %). **v2_fa4**
 (`cute_kernels/gemm_w4a4/kernel_v2_fa4.py`, FA4-derived warp-specialized
-3-pipeline, 2-CTA persistent) is the shipping surface — 16.9 %–27.3 %
-MFU on production shapes, fp16 ahead of nunchaku on 4/4 apples-to-
-apples shapes and bf16 ahead on 2/4 (one within ±0.5 pp noise, one
-still 3.2 pp behind).
+3-pipeline, 2-CTA persistent) is the shipping surface that produces
+the numbers above.
 
 The most valuable single-line change in the whole project: halving
 the per-CTA SMEM-byte estimate for the LoRA-up weight tile under
