@@ -164,7 +164,8 @@ you work here:
 
 Current state: the Triton pod `quantize_w4a4_act_fuse_lora` is real
 and passes smoke. The CuTe DSL `gemm_w4a4` is in progress — the
-shared-tmem feasibility check lives at `tmp/verify_tmem_layout.py`.
+shared-tmem feasibility check lives at
+`cute_kernels/gemm_w4a4/verify_tmem_layout.py`.
 All AscendC pods are host-side stubs so the build stays green before
 real device code lands. The Ascend-side `gemm_w4a4` pod under
 `csrc/kernels/gemm_w4a4/` keeps only the host header + stub; the

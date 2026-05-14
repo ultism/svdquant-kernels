@@ -96,7 +96,8 @@ Per-shape `(K_atoms, R_atoms, stride)` with `K_BLK = 64`, `LORA_K = 16`:
 
 1. **Shared-tmem TV-layout match.** Main NVFP4 acc fragment layout
    == LoRA fp16/bf16 acc fragment layout over the chosen
-   `mma_tiler_mn`. Verified at trace time by `tmp/verify_tmem_layout.py`
+   `mma_tiler_mn`. Verified at trace time by
+   `cute_kernels/gemm_w4a4/verify_tmem_layout.py`
    — both `1SM 128x256` and `2SM 256x256` must pass. If a future
    config breaks the match, this whole design collapses to separate
    tmem regions + epilogue sum (extra tmem traffic, uglier code).

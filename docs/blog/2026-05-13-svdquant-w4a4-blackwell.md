@@ -1,11 +1,13 @@
 # SVDQuant W4A4 on Blackwell — a tour through the primitives
 
-*A teaching post for community kernel developers writing CuTe DSL
-on SM_100/SM_103. Walks through how this repo's `gemm_w4a4` kernel
-re-architected from a 1-CTA stock CUTLASS port to a 2-CTA persistent
-FA4-derived kernel, what each Blackwell primitive does for it, and
-which single-line accounting bug was hiding +198 % TF behind a
-"runs fine" smoke.*
+*How to keep a complex pipeline-synchronization state space from
+deadlocking on Blackwell, by borrowing FlashAttention-4's
+synchronization scaffolding (explicit per-warp pipeline state +
+warp specialization + persistent tile scheduler) instead of writing
+your own state machine. A walk-through on this repo's `gemm_w4a4`
+kernel — re-architected from a 1-CTA stock CUTLASS port to a 2-CTA
+persistent FA4-derived kernel — and the one-line SMEM-accounting bug
+worth +198 % TF that was hiding behind a "runs fine" smoke.*
 
 ## 1. tl;dr
 
@@ -21,19 +23,29 @@ production shape; the Phase-1 attempt to lift it to 2-CTA via
 `cta_group=TWO` got essentially zero benefit (28 % vs 27 %). **v2_fa4**
 (`cute_kernels/gemm_w4a4/kernel_v2_fa4.py`, FA4-derived warp-specialized
 3-pipeline, 2-CTA persistent) is the shipping surface — 16.9 %–27.3 %
-MFU on production shapes, fp16 4/4 ahead of nunchaku and bf16 3/4
-ahead on the apples-to-apples shapes.
+MFU on production shapes, fp16 ahead of nunchaku on 4/4 apples-to-
+apples shapes and bf16 ahead on 2/4 (one within ±0.5 pp noise, one
+still 3.2 pp behind).
 
-The most valuable single-line change in the whole project: halving the
-LU SMEM byte estimate per CTA under 2-CTA. The handwritten
-`lora_smem_bytes` arithmetic feeding `_compute_stages` was 2× too high
-on the LU operand; the budget solver silently clamped `num_ab_stage`
-from 4 down to 2. Symptom: nothing — kernel compiled, ran, was
-numerically correct, and looked "just slow." Fix: one extra
-`// self.cta_group_size`. Wall-clock at the production shape:
-**566 TF → 1685 TF (+198 %)**, **4.2 % → 16.9 % MFU**. ncu A/B at the
-same launch config: Duration −31.2 %, SM Throughput +11.99 pp, SM
-Active Cycles −36.3 %. Commit `7296e90`; full data in §7.
+The most valuable single-line change in the whole project: halving
+the per-CTA SMEM-byte estimate for the LoRA-up weight tile under
+2-CTA mode. The kernel computes its SMEM budget at trace time —
+"given this much shared memory per SM, how many in-flight K-blocks
+can the main K-loop juggle, and how many stages of LoRA prefetch
+can we afford?" The formula for the LoRA-up tile's share was
+hand-written, and it overlooked one thing: under 2-CTA mode the
+hardware already shards that tile across the two CTAs in a cluster,
+so each CTA's actual on-chip allocation is half of what the formula
+returned. The budget solver, fed that 2× overestimate, silently
+cut the main K-loop pipeline depth in half (from 4 in-flight
+K-blocks down to 2) to "make room" for shared memory that wasn't
+actually being used. Symptom: nothing — kernel compiled, ran, was
+numerically correct, and just looked "a bit slow." Fix: one extra
+division by the cluster's CTA-group size in that one line. Wall-clock
+at the production shape: **566 TF → 1685 TF (+198 %)**, **4.2 % →
+16.9 % MFU**. ncu A/B at the same launch config: Duration −31.2 %,
+SM Throughput +11.99 pp, SM Active Cycles −36.3 %. Commit `7296e90`;
+full data in §7.
 
 This post walks both stories together, because they're the same story:
 the kernel only exposes the LU SMEM bug *after* the FA4 rewrite makes
@@ -56,18 +68,10 @@ in production, R=32 most common). `wcscale` and `bias` are per-output-
 column. There's no chained data flow, no softmax, no online correction:
 one main MMA, one LoRA MMA, one fused affine.
 
-Three design constraints frame everything that follows:
+Two design constraints frame everything that follows:
 
-- **vLLM drop-in at the linear boundary.** Inputs come in and outputs
-  come out; we do not see what op runs next. nunchaku's `fuse_glu`
-  shortcut (absorbing the preceding SwiGLU gate into the quantize
-  step) and the `fused_gelu_mlp` path (next layer's `smooth_factor`
-  leaking back into this layer's epilogue) are off the table — both
-  require frame-level fusion. The next-layer NVFP4 quantize epilogue
-  (a v3 idea) was dropped for the same reason in
-  `docs/architecture.md`.
 - **SM_100 / SM_103 only.** Consumer Blackwell SM_120a/121a is covered
-  by nunchaku (`tmp/nunchaku/setup.py:41-64` lists its arch matrix).
+  by nunchaku (`nunchaku/setup.py:41-64` lists its arch matrix).
   This repo exists to fill the data-center Blackwell gap, and Ampere
   through Hopper is also out of scope. So the kernel can assume
   `tcgen05` scaled-MMA, TMEM, 2-CTA dense MMA, TMA bundles, and the
@@ -128,6 +132,18 @@ The first three lines are *Python trace-time* mutations of the
 them in the MLIR. The fourth line is the actual `umma.commit` that
 fires on device.
 
+**Footnote on the "NVFP4" we use vs. the cuBLAS NVFP4 linear.** The
+full NVFP4 spec is *two* levels of scaling — a per-tensor FP32 scale
+plus a per-16-element FP8-E4M3 block scale. nunchaku's design, which
+we inherit, uses a single level: the block scale only, with any
+per-tensor scaling absorbed into the block scale (or into `wcscale`)
+at calibration time. cuBLAS's NVFP4 linear, by contrast, exposes
+both levels at runtime. The two are mathematically equivalent when
+the tensor scale is folded in offline; the difference is in what the
+spec carries through to the runtime API, not in the achievable
+precision. We follow nunchaku here because the LoRA + `wcscale`
+machinery already absorbs the tensor scale naturally.
+
 ### 3.2 2-CTA dense MMA via `cta_group=TWO`
 
 Two CTAs in a `cluster_shape=(2, 1)` cluster cooperate on a single
@@ -145,14 +161,10 @@ cluster_shape_mn = (2, 1), CtaGroup.TWO:
   rank=1 → flat coord (1, 0, 0, 0)   ← follower CTA
 ```
 
-The trap, written up at `docs/gotchas/cute_dsl.md:90-151`: the per-CTA
-M-within-cluster position lives at **index `[0]` (V)**, not `[2]` (N).
-Reading `[2]` looks tempting because the *problem*'s N axis lives there,
-but `[2]` is the cluster's N split — both CTAs in an M-major pair
-share `[2] = 0`, so using it as a CTA-distinguisher hands every tile
-to the leader and breaks persistent tile decode. The non-persistent
-counterpart at `cute_kernels/gemm_w4a4/kernel.py:956-960` uses
-`bidx // atom_thr_size` for the same coord.
+(Reading the right index out of `cluster_layout_vmnk` to recover
+the per-CTA M position under 2-CTA is the kind of code-understanding
+trap that doesn't belong in primitive-teaching prose; the write-up
+is at `docs/gotchas/cute_dsl.md:90-151` if you want it.)
 
 The SMEM payoff. Under `CtaGroup.TWO`, the MMA atom's
 `partition_shape_A` *halves* A along M and `partition_shape_B` halves
@@ -270,7 +282,7 @@ The file at `cute_kernels/gemm_w4a4/kernel.py` is v1: main NVFP4
 scaled-MMA + β-interleaved LoRA, 1-CTA only, monolithic `@cute.kernel`,
 stock `cutlass.pipeline.PipelineState`. Its docstring is candid about
 the lineage: ported from
-`tmp/cutlass/examples/python/CuTeDSL/blackwell/
+`cutlass/examples/python/CuTeDSL/blackwell/
 dense_blockscaled_gemm_persistent.py`, with the persistent
 TileScheduler stripped, clusters > 1 stripped, TMA multicast stripped,
 `overlapping_accum` stripped, and the `tile_n ∈ {64, 192}` SFB-shift
@@ -371,7 +383,7 @@ the state machinery entirely. That's the next section.
 ## 5. Why FA4 — the scaffolding we adopted
 
 FA4 (the Blackwell forward pass in Flash-Attention 4, source at
-`tmp/flash-attention/flash_attn/cute/`) had already solved the
+`flash-attention/flash_attn/cute/`) had already solved the
 5-dimensional state-space problem for a different op: attention. The
 solution was to make the pipeline state **explicit and per-warp**,
 make the persistent tile loop the kernel's outermost structure, and
@@ -573,7 +585,7 @@ The mechanism rides on three Blackwell facts:
    must land in the *same* TMEM cell under both atoms. The match is
    checked at trace time (referenced in the kernel docstring at
    `kernel_v2_fa4.py:1261-1270`; the original verification ran via
-   `tmp/verify_tmem_layout.py` during bring-up, both for
+   `cute_kernels/gemm_w4a4/verify_tmem_layout.py` during bring-up, both for
    `1SM 128×256` and `2SM 256×256`).
 
 The interleave pattern itself is one extra branch per main atom in
@@ -1038,7 +1050,7 @@ things to take from the table."
 ### 9.2 The implementation-quality reference — nunchaku on RTX PRO 6000
 
 nunchaku NVFP4 is gated on `__CUDA_ARCH__ >= 1200` (SM_120a/121a, see
-`tmp/nunchaku/setup.py:41-64`), so we can't run it on B200 — there is
+`nunchaku/setup.py:41-64`), so we can't run it on B200 — there is
 no nunchaku binary for SM_100. We run it on RTX PRO 6000 Blackwell
 Server Edition (SM_120a) as an *implementation-quality reference*,
 not a ceiling. Hardware peaks differ 2.5× (B200's 10 PFLOPS NVFP4 vs
@@ -1052,13 +1064,13 @@ if you stay inside one side's column.
 | 4352 × 15360 × 3840  × R=128    |  **27.3**        |   25.0                   |  +2.3 |   27.3    |   30.5        |  −3.2 |
 | 4352 × 10240 × 3072  × R=32     |  **26.4**        |   21.4                   |  +5.0 |  **26.2** |   25.2        |  +1.0 |
 
-(Source: `docs/gpu.md:314-319`.) **fp16: 4/4 shapes ahead. bf16: 3/4
-shapes ahead.** The one bf16 shape where nunchaku still leads
-(M=4352 K=15360 N=3840, −3.2 pp) is the "bf16 hand-PTX vs DSL MLIR
-lowering" asymmetry called out in `docs/gpu.md:79-103`: nunchaku's
-MMA is inline PTX (`mma_earlycuda.cuh`), two separately hand-tuned
-paths for fp16 vs bf16 with different register packing and acc-
-precision choices. Ours goes through one `tcgen05` atom with
+(Source: `docs/gpu.md:314-319`.) **fp16: 4/4 shapes ahead. bf16: 2/4
+ahead, 1/4 within ±0.5 pp noise, 1/4 still 3.2 pp behind** on the
+M=4352 K=15360 N=3840 shape. That −3.2 pp gap is the "bf16 hand-PTX
+vs DSL MLIR lowering" asymmetry called out in `docs/gpu.md:79-103`:
+nunchaku's MMA is inline PTX (`mma_earlycuda.cuh`), two separately
+hand-tuned paths for fp16 vs bf16 with different register packing
+and acc-precision choices. Ours goes through one `tcgen05` atom with
 `ab_dtype` substitution — same MLIR lowering for both. Closing the
 last 3 pp on bf16 likely requires dropping to inline PTX, which is
 out of scope.
@@ -1166,10 +1178,10 @@ Cross-link: the Ascend (Atlas A3) side of the same op lives at
 same. The architecture rationale for the format split is in
 `docs/architecture.md` and `CLAUDE.md`.
 
-**Thanks.** To Verda (启智社区) for the B200 image with unrestricted
-ncu — the LU SMEM fix would have read as wall-clock noise on a
-counter-restricted host, and the C1 mechanism analysis literally
-required counter access. To Tri Dao's Flash-Attention 4 for the
+**Thanks.** To Verda for the B200 image with unrestricted ncu — the
+LU SMEM fix would have read as wall-clock noise on a counter-
+restricted host, and the C1 mechanism analysis literally required
+counter access. To Tri Dao's Flash-Attention 4 for the
 warp-spec scaffolding pattern that made the entire FA4-derived
 rewrite possible. To NVIDIA's CUTLASS team for both the
 `dense_blockscaled_gemm_persistent.py` reference and the Modular
