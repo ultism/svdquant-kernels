@@ -545,9 +545,20 @@ LoRA.
 
 The mechanism rides on three Blackwell facts:
 
-1. **`tcgen05` issue queue is per-CTA in-order.** Atoms enqueued
-   later observe the effects of atoms enqueued earlier. So a LoRA
-   atom enqueued after main atom *k* sees main atom *k*'s TMEM write.
+1. **`tcgen05` honors the accumulator's RAW dependency at SASS-
+   scoreboard level.** Both atoms write the same TMEM cells; `ptxas`
+   marks that as a data dependency and emits the scoreboard
+   write/wait bits in each instruction's control word, so the LoRA
+   atom's `UTCHMMA` retires only after the preceding main `UTCOMMA`.
+   No software fence required. (Worth flagging because the PTX
+   manual's §9.7.16.6.2 — "pipelined pair" requires same
+   `kind`/shape/acc — reads as if a mixed-kind pair like ours needs a
+   `tcgen05.fence`. It doesn't. That rule is about whether two atoms
+   can **overlap in the tensor pipe**, not whether their writes to a
+   shared accumulator stay in order; ordering lives one level below
+   PTX. Confirmed against the cubin: zero `tcgen05.fence` in PTX,
+   zero `FENCE.*` between `UTCOMMA`/`UTCHMMA` in SASS; CUTLASS
+   upstream is identical.)
 2. **Two atoms can target the same TMEM address.** Via
    `gemm_ptx_partial(acc_tmem_addr: Int32)`, both atoms write to the
    same FP32 accumulator cells. No `cute.Tensor` alias trick required
@@ -561,12 +572,24 @@ The mechanism rides on three Blackwell facts:
    `cute_kernels/gemm_w4a4/verify_tmem_layout.py` during bring-up, both for
    `1SM 128×256` and `2SM 256×256`).
 
+What we *do* pay is loss of pipeline overlap at the kind-switch
+boundary — the LoRA atom serializes against its two neighboring main
+atoms instead of overlapping with them in the tensor pipe.
+Invisible at production density (one LoRA per `stride = K_atoms /
+R_atoms` ≈ 7–8 main atoms at R=128): `stall_short_sb` — the
+scoreboard stall that would catch it — measures 0.42 cyc/inst on
+v2, indistinguishable from the no-LoRA CUTLASS reference at 0.55
+(`log/ncu_summary.md`). The alternative — keeping main and LoRA on
+*separate* accumulators and merging later — would add a TMEM-load
+plus a TMEM-store per tile, which dwarfs the few cycles of overlap
+we give up.
+
 The interleave pattern itself is one extra branch per main atom in
 the K-loop. `stride = K_atoms // R_atoms` controls how often a LoRA
 atom fires; `r_next` and `next_lora_at` track which LoRA atom is up
 and when. Source at `kernel_v2_fa4.py:1309-1376`:
 
-![β-interleave: LoRA atoms sprinkled into the main K-loop hit the same TMEM region via the per-CTA in-order tcgen05 issue queue](figures/beta_interleave_en.png)
+![β-interleave: (A) main NVFP4 atom and LoRA fp16/bf16 atom both target (B) the same FP32 TMEM acc (framed, shared block) via `acc_tmem_addr: Int32`; (C) tcgen05 issue order numbers each atom — main at 1/2/3/5/6/7/9/10/11, LoRA at 4/8/12 every `stride = K_atoms/R_atoms`; (D) tensor-pipe timeline shows same-kind atoms overlap (1↔2↔3), but each LoRA injection costs TWO retire bubbles — pink "no overlap" bands flanking each LoRA on both sides (M→L drains the pipe, L→M re-primes it); ghost bars mark where the next atom would have run under same-kind pipelining](figures/beta_interleave_en.png)
 
 The MLIR-tracing detail worth understanding: `tiled_mma.set(
 tcgen05.Field.ACCUMULATE, ...)` is a **Python trace-time mutation**.

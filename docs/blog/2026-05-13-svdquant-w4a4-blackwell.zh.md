@@ -464,9 +464,18 @@ LoRA 校正项 `lora_act_in @ lora_up` 很小（R ≤ 128）。如果和主 MMA 
 
 机制立在三条 Blackwell 事实上：
 
-1. **`tcgen05` 发射队列在每 CTA 内顺序**。后入队的 atom 看得到先入队
-   atom 的效果。所以排在主 atom *k* 之后的 LoRA atom 能看到主 atom *k*
-   的 TMEM 写入。
+1. **`tcgen05` 在 SASS scoreboard 这一层尊重累加器的 RAW 依赖**。两条
+   atom 写同一组 TMEM cell；`ptxas` 把这识别为数据依赖，在指令控制字
+   里发出 scoreboard write/wait 编码，LoRA atom 的 `UTCHMMA` 必然要等
+   前一条主 `UTCOMMA` retire 后才完成。不需要软件 fence。（这条值得
+   单独点出来，因为 PTX 手册 9.7.16.6.2 给的 "pipelined pair" 集合
+   要求 `kind`/shape/acc 都同 —— 我们这对 kind 不同，落在集合外；粗
+   读容易解读成"切 kind 要插 `tcgen05.fence`"，**其实不需要**。pair
+   规则约束的是两条 atom 能否在 tensor pipe 里**重叠流水**，不是它
+   们对共享 acc 的写是否保持顺序；顺序由 PTX 之下一层的 SASS scoreboard
+   保证。对着 cubin 验过：PTX 里 0 个 `tcgen05.fence`，SASS 里
+   `UTCOMMA`/`UTCHMMA` 之间 0 个 `FENCE.*`；CUTLASS 上游也是同套
+   模型。）
 2. **两条 atom 可以打到同一个 TMEM 地址**。通过
    `gemm_ptx_partial(acc_tmem_addr: Int32)`，两条 atom 写到同一组
    FP32 累加器 cell。不需要 `cute.Tensor` 别名套路（v1 走的别名路；
@@ -478,12 +487,20 @@ LoRA 校正项 `lora_act_in @ lora_up` 很小（R ≤ 128）。如果和主 MMA 
    引用；原始校验通过 `cute_kernels/gemm_w4a4/verify_tmem_layout.py` 在 bring-up 期跑，
    `1SM 128×256` 和 `2SM 256×256` 都验过）。
 
+真正付的代价是 kind 切换边界丢掉流水重叠 —— LoRA atom 和它两侧的主
+atom 不能在 tensor pipe 里并发，只能串行。在生产密度下看不见（R=128
+时大约每 `stride = K_atoms / R_atoms` ≈ 7–8 个主 atom 才撒一个 LoRA）：
+能抓到这件事的指标 `stall_short_sb` 在 v2 上测出来 0.42 cyc/inst，
+和 CUTLASS 不带 LoRA 的 0.55 没区别（`log/ncu_summary.md`）。反过来
+如果不共享 acc —— 主 MMA 和 LoRA 写两份独立累加器再合并 —— 每个 tile
+要多走一次 TMEM-load + TMEM-store，代价远高于这几拍丢掉的重叠。
+
 interleave pattern 本身就是 K-loop 主 atom 每次多一个分支。
 `stride = K_atoms // R_atoms` 控制 LoRA atom 多久发一次；`r_next` 和
 `next_lora_at` 跟踪当前哪个 LoRA atom 上场、下次发在哪。源码在
 `kernel_v2_fa4.py:1309-1376`：
 
-![β-interleave：LoRA atom 撒进主 K-loop，靠每 CTA 顺序 tcgen05 发射队列打到同一块 TMEM 区](figures/beta_interleave_zh.png)
+![β-interleave：(A) 主 NVFP4 atom 和 LoRA fp16/bf16 atom 都通过 `acc_tmem_addr: Int32` 打到 (B) 同一块 FP32 TMEM 累加器（加粗框出的共享块）；(C) tcgen05 发射顺序里每个 atom 都编号 —— 主在 1/2/3/5/6/7/9/10/11、LoRA 每 `stride = K_atoms/R_atoms` 撒一个在 4/8/12；(D) tensor pipe 时间线显示同 kind 的 atom 互相重叠（1↔2↔3），但每次 LoRA 注入要付**两个** retire 气泡 —— 每个 LoRA 两侧各一条粉色"无重叠"带（主→LoRA 抽干 pipe、LoRA→主 重新填满）；幻影条标出如果能流水的话该 atom 本应在哪](figures/beta_interleave_zh.png)
 
 值得理解的 MLIR trace 细节：`tiled_mma.set(tcgen05.Field.ACCUMULATE,
 ...)` 是 **Python trace 期对对象的修改**。每个 `cute.gemm` 调用点在
