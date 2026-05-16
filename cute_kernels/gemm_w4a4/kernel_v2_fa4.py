@@ -123,6 +123,7 @@ def launch_v2(
     out_dtype: torch.dtype = torch.float16,
     use_2cta: bool = False,
     tiler_mn: Tuple[int, int] | None = None,
+    lora_schedule: str = "interleave",
 ) -> torch.Tensor:
     """v0: y = scaled_mma(act_nvfp4, wgt_nvfp4). No LoRA, no affine.
     v1 (both lora_* provided): y += lora_act_in @ lora_up.T, β-interleaved
@@ -151,7 +152,7 @@ def launch_v2(
 
     cache_key = (
         _cutlass_c_dtype(out_dtype), tiler, _SF_VEC_SIZE, cluster_shape_mn,
-        enable_lora, R, enable_wc, enable_bias,
+        enable_lora, R, enable_wc, enable_bias, lora_schedule,
     )
     compiled = _COMPILED_CACHE.get(cache_key)
     if compiled is None:
@@ -160,6 +161,7 @@ def launch_v2(
             cluster_shape_mn=cluster_shape_mn,
             enable_lora=enable_lora, R=R,
             enable_wc=enable_wc, enable_bias=enable_bias,
+            lora_schedule=lora_schedule,
         )
         _COMPILED_CACHE[cache_key] = compiled
 
@@ -232,6 +234,7 @@ def _compile_v2(
     R: int = 0,
     enable_wc: bool = False,
     enable_bias: bool = False,
+    lora_schedule: str = "interleave",
 ):
     kernel_obj = Sm100GemmW4A4V2FA4(
         sf_vec_size=_SF_VEC_SIZE,
@@ -244,6 +247,7 @@ def _compile_v2(
         R=R,
         enable_wc=enable_wc,
         enable_bias=enable_bias,
+        lora_schedule=lora_schedule,
     )
     a_ptr = make_ptr(cutlass.Float4E2M1FN, 0, cute.AddressSpace.gmem, assumed_align=32)
     b_ptr = make_ptr(cutlass.Float4E2M1FN, 0, cute.AddressSpace.gmem, assumed_align=32)
@@ -292,7 +296,11 @@ class Sm100GemmW4A4V2FA4:
         R: int = 0,
         enable_wc: bool = False,
         enable_bias: bool = False,
+        lora_schedule: str = "interleave",
     ):
+        assert lora_schedule in ("interleave", "end_grouped"), \
+            f"lora_schedule must be 'interleave' or 'end_grouped'; got {lora_schedule!r}"
+        self.lora_schedule = lora_schedule
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         assert mma_tiler_mn[0] in (128, 256), "tile_m ∈ {128, 256}"
@@ -1308,16 +1316,24 @@ class Sm100GemmW4A4V2FA4:
 
                 # β-interleave state (design §2). `stride` = # main atoms
                 # between LoRA atoms; `R_atoms` total LoRA atoms scheduled
-                # evenly across all main K atoms. tcgen05 issue queue is
-                # per-CTA in-order, so the LoRA atom sees the preceding
-                # main atom's tmem write. Leader CTA only (2-CTA: leader
-                # issues both main and LoRA, cluster MMAs propagate).
+                # evenly across all main K atoms. Shared-acc RAW dependency
+                # serializes per-CTA across kinds; pair-pipeline rule (PTX
+                # 9.7.16.6.2) only applies same-kind+shape, so kind switches
+                # disable overlap (cost = lost pipelining, not correctness).
+                # `lora_schedule == "end_grouped"` is the bench A/B path —
+                # disables inline inject (sentinel `next_lora_at = -1`) and
+                # emits all R_atoms LoRA atoms in a dedicated loop after the
+                # K-loop, so the K-loop becomes a same-kind UTCOMMA run.
                 r_next = cutlass.Int32(0)
                 next_lora_at = cutlass.Int32(0)
                 k_atom_flat = cutlass.Int32(0)
+                stride = cutlass.Int32(0)
                 if cutlass.const_expr(self.enable_lora):
                     k_atoms_total = k_tile_cnt * num_kblocks
-                    stride = k_atoms_total // self.R_atoms
+                    if cutlass.const_expr(self.lora_schedule == "interleave"):
+                        stride = cutlass.Int32(k_atoms_total // self.R_atoms)
+                    else:
+                        next_lora_at = cutlass.Int32(-1)
 
                 for k_tile in range(k_tile_cnt):
                     if is_leader_cta:
@@ -1349,7 +1365,14 @@ class Sm100GemmW4A4V2FA4:
                             # β-interleave: inject LoRA atom every `stride`
                             # main atoms. Shared-tmem acc means the LoRA
                             # gemm += into the same tCtAcc cells (verified).
-                            if cutlass.const_expr(self.enable_lora):
+                            # `const_expr` gates the inline trace — end_grouped
+                            # elides the inline LoRA atom entirely so PTX shows
+                            # only main UTCOMMA in the K-loop (no predicate-
+                            # masked f16 mma's contaminating SASS / ncu).
+                            if cutlass.const_expr(
+                                self.enable_lora
+                                and self.lora_schedule == "interleave"
+                            ):
                                 if r_next < self.R_atoms and k_atom_flat == next_lora_at:
                                     # C2: lazy consumer_wait — first LoRA
                                     # atom of this tile blocks here, not at
@@ -1377,6 +1400,27 @@ class Sm100GemmW4A4V2FA4:
                                 k_atom_flat += 1
                         pipeline_aw.consumer_release(aw_consumer_state)
                     aw_consumer_state.advance()
+
+                # End-grouped: emit all R_atoms LoRA atoms in a same-kind run
+                # after the main K-loop, so the K-loop UTCOMMA chain and the
+                # post-loop UTCHMMA chain are each pair-pipelinable. Only one
+                # kind switch total per tile (between main and LoRA), vs
+                # `interleave` which switches every `stride` main atoms.
+                if cutlass.const_expr(
+                    self.enable_lora and self.lora_schedule == "end_grouped"
+                ):
+                    if is_leader_cta:
+                        pipeline_lora.consumer_wait(lora_consumer_state)
+                        for r in cutlass.range(self.R_atoms, unroll_full=True):
+                            lora_kblock_coord = (
+                                None, None, r, lora_consumer_state.index,
+                            )
+                            cute.gemm(
+                                tiled_mma_lora, tCtAcc_lora,
+                                tCrLA[lora_kblock_coord],
+                                tCrLU[lora_kblock_coord],
+                                tCtAcc_lora,
+                            )
 
                 # LoRA consumer release (per tile; LA/LU smem freed).
                 if cutlass.const_expr(self.enable_lora):

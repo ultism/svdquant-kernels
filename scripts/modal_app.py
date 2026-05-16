@@ -354,6 +354,22 @@ def gemm_v2_fa4_c1_bench() -> None:
     )
 
 
+@app.function(gpu="B200", image=triton_image, timeout=1800)
+def gemm_v2_kind_pipeline_bench() -> None:
+    """Micro-bench: `lora_schedule` interleave vs end_grouped at 1:1 ratio.
+
+    Same total FLOPs, only mma emission order differs. Tests whether the
+    PTX 9.7.16.6.2 pair-pipeline rule (same kind+shape only) shows up in
+    wall time on B200/B300. Expected: end_grouped < interleave when the
+    K-loop ratio is dense enough for the saved overlap to dominate TMA
+    wait.
+    """
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/bench_kind_pipeline.py"], check=True
+    )
+
+
 @app.function(gpu="B200", image=triton_image, timeout=900)
 def gemm_v0_fa4_probe() -> None:
     """Bug 3 bisect: single shape (M=256 K=3840 fp16 1-CTA) with an
