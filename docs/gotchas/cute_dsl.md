@@ -345,3 +345,59 @@ Reference anchors:
 - `cute_kernels/gemm_w4a4/kernel_v2_fa4.py::_setup_attributes` —
   `lora_smem_bytes` block with the comment citing this gotcha.
 - `docs/gpu.md` § "v2_fa4 LU SMEM accounting fix" — full data.
+
+## `tcgen05.mma` switching kind/shape doesn't need `tcgen05.fence` — RAW on the acc serializes, pair-pipeline rule only governs overlap
+
+**Symptom.** PTX 9.7.16.6.2 lists "pipelined" pairs that require
+matching kind, shape, accumulator, and CTA-group. Naïve reading: a
+LoRA `tcgen05.mma.kind::f16` issued after a main
+`tcgen05.mma.kind::mxf4nvf4.block_scale` to the same accumulator is
+*outside* the pair, so it must need a `tcgen05.fence` between them.
+v2_fa4's β-interleave does exactly this back-to-back, with no fence in
+source — and produces correct results.
+
+**Why.** "Pipelined" in 9.7.16.6.2 is about **execution overlap** — it
+guarantees the second mma *can issue* into the tensor pipe before the
+first one retires. Outside the pair the overlap guarantee goes away,
+but **ordering does not**: writing the same TMEM acc address makes the
+two mma's a RAW dependency, and the SASS scheduler (`ptxas`) enforces
+that by emitting a short-scoreboard wait in the second instruction's
+control word. CUTLASS upstream has zero `tcgen05.fence` calls anywhere
+in its SM_100 headers — same reasoning.
+
+The empirical signature was a clean three-way:
+
+- **SASS distance**: same-kind same-shape mma's are emitted 16 bytes
+  apart (one SASS slot, back-to-back); kind-switching mma's are
+  144-240 bytes apart (9-15 SASS slots of scoreboard machinery
+  between them).
+- **ncu K=1024 4:1 A/B**: branch instructions +12.3%, SMSP active
+  cycles +3.3% in `interleave` vs `end_grouped`.
+- **bench K=3840 30:1 production**: only +0.5% wall-time delta — the
+  switch cost is amortized over long same-kind runs.
+
+**Apply.**
+
+- **Do not** insert `tcgen05.fence` between mma's of different kinds
+  sharing an acc. It's a no-op for correctness and disables a possible
+  future overlap if the kinds align later. The DSL does not expose
+  this fence anyway (only `tcgen05.commit`).
+- **`tcgen05.fence` is for sync↔async proxy crossings** — i.e., a
+  thread reading the acc back via `tcgen05.ld` after async mma writes.
+  We already cover that path with `tcgen05.commit` + mbarrier wait in
+  the producer/consumer pipeline.
+- **Pair-pipeline savings are real but rank-dependent.** If you want
+  to maximize same-kind chains, group LoRA atoms at the K-loop tail
+  via `lora_schedule="end_grouped"`. At production R=128 sparsity
+  (30:1) the win is <1 % so don't ship the variant; at denser R the
+  payoff scales with K-loop run length.
+
+Reference anchors:
+
+- `cute_kernels/gemm_w4a4/kernel_v2_fa4.py` — `lora_schedule` knob
+  (`interleave` | `end_grouped`); A/B harness in `tmp/bench_kind_pipeline.py`
+  + `tmp/profile_kind_pipeline.py`.
+- `log/ncu_kind_{interleave,end_grouped}_4352_1024_3072_R64.ncu-rep` —
+  K=1024 4:1 ncu A/B raw reports.
+- `tmp/cute_dump_ab/{interleave,end_grouped}/` — PTX + SASS dumps showing
+  the 16-byte vs 144-240-byte mma spacing.
